@@ -93,15 +93,15 @@ parameter_schema = {
 
 ### Phase 7 – Algo-Darstellungs-Picker (Stil-Widget aus PyTrader übernehmen)
 
-- [ ] 7.1 **Commit vor Schritt** (`playground_step7`): sauberer Ausgangspunkt
-- [ ] 7.2 `ui/style_models.py` anlegen (Plotly-Version: `LineStyle`/`MarkerStyle`, `LINE_STYLES` = 6 Plotly-Dash-Werte, `PLOTLY_SYMBOLS` = kuratierte Auswahl, `to_dict`/`from_dict`)
-- [ ] 7.3 `ui/style_picker_widget.py` anlegen (aus PyTrader kopiert, angepasst: Imports `ui.style_models`, `LINE_STYLES`/`PLOTLY_SYMBOLS`, Plotly-kompatible Werte)
-- [ ] 7.4 `ParamFormWidget`: Schema-Typ `"color"` → `StylePickerWidget` rendern; `_ctrl_value` + Sibling-Keys (`hidden`) beim Params-Emit mitnehmen
-- [ ] 7.5 `PlaygroundChartService`: Overlay-Trace verarbeitet `dash`/`width`/`symbol`/`size` + `render`-Modus (lines/lines+markers/markers)
-- [ ] 7.6 Controller: `_build_instance_traces`/`_js_add_overlay`/`_js_update_overlay` nutzen Stil-Params; Farbzyklus nur als Fallback
-- [ ] 7.7 `alg_sma` (Referenz-Algo): Darstellungs-Defaults (`line_color`/`line_style`/`line_width`) ins `parameter_schema`
-- [ ] 7.8 Test in `test/test.py`: Stil-Roundtrip (Defaults aus Schema, Widget-Read, Sibling-Keys in `instance_params`, Plotly-HTML enthält `dash`/`width`/`symbol`), Persistenz-Save/Restore
-- [ ] 7.9 **Commit** + Implementierungs-Log in Kapitel 5
+- [x] 7.1 **Commit vor Schritt** (`playground_step7`): sauberer Ausgangspunkt
+- [x] 7.2 `ui/style_models.py` anlegen (Plotly-Version: `LineStyle`/`MarkerStyle`, `LINE_STYLES` = 6 Plotly-Dash-Werte, `PLOTLY_SYMBOLS` = kuratierte Auswahl, `to_dict`/`from_dict`)
+- [x] 7.3 `ui/style_picker_widget.py` anlegen (aus PyTrader kopiert, angepasst: Imports `ui.style_models`, `LINE_STYLES`/`PLOTLY_SYMBOLS`, Plotly-kompatible Werte)
+- [x] 7.4 `ParamFormWidget`: Schema-Typ `"color"` → `StylePickerWidget` rendern; `_ctrl_value` + Sibling-Keys (`hidden`) beim Params-Emit mitnehmen
+- [x] 7.5 `PlaygroundChartService`: Overlay-Trace verarbeitet `dash`/`width`/`symbol`/`size` + `render`-Modus (lines/lines+markers/markers)
+- [x] 7.6 Controller: `_build_instance_traces`/`_js_add_overlay`/`_js_update_overlay` nutzen Stil-Params; Farbzyklus nur als Fallback
+- [x] 7.7 `alg_sma` (Referenz-Algo): Darstellungs-Defaults (`line_color`/`line_style`/`line_width`) ins `parameter_schema`
+- [x] 7.8 Test in `test/test.py`: Stil-Roundtrip (Defaults aus Schema, Widget-Read, Sibling-Keys in `instance_params`, Plotly-HTML enthält `dash`/`width`/`symbol`), Persistenz-Save/Restore
+- [x] 7.9 **Commit** (`cc6bead`) + Implementierungs-Log in Kapitel 5
 - [ ] **STOPP → UI-Review:** StylePicker-Button + Dialog (Farbe, Linienart, Stärke, Symbol-Dropdown), Persistenz nach Neustart?
 
 ---
@@ -119,6 +119,13 @@ parameter_schema = {
 
 > Format: `**DD.MM.YYYY, HH:MM – <ID> <Beschreibung>**`. Einträge erfolgen erst nach expliziter Freigabe des Anwenders.
 
-- **17.08.2026 – Phase 7-Konzept** Algo-Darstellungs-Picker (Farbe/Linienart/Stärke/Symbol) dokumentiert: Übernahme des PyTrader-`StylePickerWidget`/`StylePickerDialog`/`style_models` (angepasst auf Plotly: 6 Dash-Werte, kuratierte Plotly-Symbole als Dropdown), Schema-Typ `"color"` in `ParamFormWidget`, Sibling-Keys-Konvention, Persistenz über `instance_params`, Farbzyklus als Fallback (Commit folgt nach Umsetzung).
-  * **Kein Coding** – reine Konzept-/Schritt-Dokumentation (Anwender-Anforderung „erstmal prüfen").
+- **17.08.2026, 14:23 – Phase 7 (playground_step7, Commit `cc6bead`)** Algo-Darstellungs-Picker umgesetzt (Kopie aus PyTrader, angepasst auf Plotly):
+  * `ui/style_models.py` (neu): `LineStyle`/`MarkerStyle`-Dataclasses mit `to_plotly()`/`to_dict()`/`from_dict()`, `LINE_STYLES` = 6 Plotly-Dash-Werte (`solid/dot/dash/longdash/dashdot/longdashdot`), `PLOTLY_SYMBOLS` = kuratierte Auswahl (~27 Symbole), Modul-Funktionen `style_sibling_keys()` (line: `line_style`/`line_width`, marker: `marker_symbol`/`marker_size`) und `collect_style_keys()`.
+  * `ui/style_picker_widget.py` (neu): `StylePickerWidget` (Button-Only mit Farb-Swatch + Vorschau-Text) + `StylePickerDialog` (TradingView-Palette, Hex/RGB-Eingabe, Alpha-Slider, `[Anpassen...]`-Fallback auf `QColorDialog`, Linienstärke 1–10 px, Linienart-Dropdown bzw. Markergröße 1–20 px + Symbol-Dropdown); Fassade `get_style()`/`set_style()`/`set_color()`/`color()`, Signal `style_changed`.
+  * `ui/param_form_widget.py`: neuer Schema-Typ `"color"` → rendert `StylePickerWidget`; `"hidden": True`-Siblings werden nicht als eigene Controls gerendert; `get_params()`/`set_params()` schreiben Farbe + Siblings über das Style-Objekt mit (`_style_from_params`).
+  * `ui/playground_chart_service.py`: Overlay-Trace verarbeitet `render` (`line`/`lines+markers`/`markers`), `dash`/`width`/`symbol`/`size`. **Bugfix:** Stil-Attribute werden direkt im `go.Scatter(...)`-Konstruktor gesetzt und die Mode-Prüfung läuft nach dem Mapping `"line"→"lines"` – vorher wurden `dash`/`width` nie gesetzt.
+  * `controllers/algo_playground_controller.py`: `_style_for_instance()` (liest Stil-Params, Farbzyklus als Fallback), `_render_mode_for_result()` (series→line, agg→markers), `_build_instance_traces`/`_js_add_overlay`/`_js_update_overlay` mit Stil-Attributen; `_recalc_overlay` filtert Stil-Keys via `collect_style_keys` – Darstellung wird **nicht** an die Algo-Klasse gereicht.
+  * `algos/alg_sma.py` (Referenz-Algo): Darstellungs-Defaults (`line_color` `#ff7f0e`/`line_style` `solid`/`line_width` 2) im `parameter_schema`.
+  * `test/test.py`: `test_phase7_style_picker` (neu) – Stil-Roundtrip, Widget, ParamForm, Chart-Service-HTML (dash/width/symbol), Controller, Persistenz. **20/20 Tests grün**.
+  * Persistenz läuft über den bestehenden `instance_params`-Roundtrip (kein Zusatzaufwand).
 
