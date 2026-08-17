@@ -3,7 +3,7 @@
 repositories/algo_results_repository.py - Persistenz der Algo-Ergebnisse.
 
 Speichert die result_schema-Felder eines AlgOS in der Tabelle `algo_results`
-(app_data.duckdb). Definition (Phase 5, Anwender-Klaerung):
+(analytics.duckdb). Definition (Phase 5, Anwender-Klaerung):
 
   * store='series' -> pro Kerze (bar_time) ein Wert (durchgehende Linie)
   * store='agg'    -> ein Wert pro Lauf (Signale/Kennzahlen)
@@ -14,20 +14,23 @@ Tabelle (normalisiert, defensiv angelegt):
      result_value) mit PK ueber alle Felder ausser value.
 
 Nur DB-Zugriff (SRP): KEIN Qt-Import, KEINE Berechnungslogik.
+# USER-REQ (17.08.2026): Algo-Persistenz liegt in analytics.duckdb (Vorgabe 3 –
+# analytics_data = nur Persistierung der Algos); app_data enthaelt nur System-/
+# App-Daten. DB_ANALYTICS statt DB_APP_DATA.
 """
 
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
-from db.db_pool import DB_APP_DATA, DbPool
+from db.db_pool import DB_ANALYTICS, DbPool
 
 ALGO_RESULTS_TABLE = "algo_results"
 
 
 class AlgoResultsRepository:
-    """Persistiert Algo-Ergebnisse (Serien/Aggregate) in app_data.duckdb."""
+    """Persistiert Algo-Ergebnisse (Serien/Aggregate) in analytics.duckdb."""
 
-    def __init__(self, db_path: str = DB_APP_DATA) -> None:
+    def __init__(self, db_path: str = DB_ANALYTICS) -> None:
         self.db_path = db_path
         self._init_table()
 
