@@ -8,7 +8,8 @@ Strategie-Logik).
 
 USER-REQ (17.08.2026): MA-Indikator aus PyTrader wirtschaftlich
 uebernommen - EIN MA-Wert statt 8 (Multi-MA-Referenz `ind_moving_averages`):
-  * Defaults wie PyTrader MA1: EHMA / period 4 / smoothing 10 / alpha 2.0.
+  * Defaults wie PineScript "TH Pivot v478" (HMA-Block): EHMA / period 4 /
+    smoothing 10 / alpha 2.0.
   * Preisquelle: nur close (kein use_close-Schalter / kein H+L+C/3).
   * dual_color (Checkbox "Auf/Ab verschiedene Farben"): MA t >= t-1 ->
     bull-Farbe, sonst bear-Farbe; Farbfelder Vorgabe Gruen/Rot
@@ -19,6 +20,12 @@ uebernommen - EIN MA-Wert statt 8 (Multi-MA-Referenz `ind_moving_averages`):
     zerlegt es in lueckenlose Farbblock-Traces (je Farbblock ein Trace mit
     expliziter Einzelfarbe und geteiltem Grenzpunkt; USER-REQ 18.08.2026:
     die Segment-Farbe folgt dem ZIELpunkt, Farbwechsel ohne Verzoegerung).
+
+USER-REQ (18.08.2026, PARITY-KORREKTUR): Die 5 Typen der Pivot-HMA-Familie
+(HMA/EMA/DEMA/TEMA/EHMA) werden EXAKT nach den Original-Algos des
+PineScripts "TH Pivot v478" berechnet (hma_ema-Feedback-Filter statt
+PyTrader-Interpretation, ta.hma mit round(sqrt(len)) statt ungerader
+Laenge; s. algos/ma_utils.py). Die Defaults bleiben EHMA/4/10/2.0.
 """
 
 from typing import Optional

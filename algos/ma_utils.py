@@ -1,6 +1,6 @@
 # algos/ma_utils.py
 """
-algos/ma_utils.py - Vektorisierte Moving-Average-Utility (aus PyTrader).
+algos/ma_utils.py - Vektorisierte Moving-Average-Utility.
 
 Wirtschaftlich uebernommen und auf PyBack adaptiert aus
 `F:\\Python\\PyTrader\\chart\\indicators\\utils\\ma_template.py`
@@ -10,18 +10,47 @@ USER-REQ (17.08.2026): MA-Indikator aus PyTrader pruefen und als Algo
 einbauen (EIN MA-Wert statt 8). Der Kern (12 MA-Typen, vektorisiert) wird
 1:1 uebernommen; LWC-spezifische Teile entfallen.
 
+USER-REQ (18.08.2026, PARITY-KORREKTUR gegen TradingView): Die 5 Typen der
+Pivot-HMA-Familie (HMA, EMA, DEMA, TEMA, EHMA) werden jetzt EXAKT nach den
+Original-Algos des PineScripts "TH Pivot v478" berechnet (nicht mehr nach
+der PyTrader-Interpretation). Referenz:
+
+  hma_ema(_src, _len, _smoothing, _alphaFactor) =>
+      hma_alphaCalc = _alphaFactor / (_len + 1)
+      hma_sum := na(hma_sum[1]) ? _src :
+          hma_alphaCalc * ta.ema(_src, _smoothing) +
+          (1 - hma_alphaCalc) * nz(ta.ema(hma_sum[1], _smoothing))
+
+  hma_dema(_src, _len, _smoothing, _alphaFactor) =>
+      hma_ema(2.0*hma_ema(_src, int(_len/2), ...) - hma_ema(_src, _len, ...),
+              int(sqrt(_len/2)), ...)
+
+Der Filter hma_ema laesst sich VEKTORISIERT schreiben (kein Loop):
+  alpha = alphaFactor/(len+1); beta = 2/(smoothing+1); gamma = beta*alpha
+  e_src = EMA(src, span=smoothing)
+  v     = EWM(e_src, alpha=gamma)                (Seed gamma*e_src[0])
+  w     = v + (beta-gamma)*e_src[0]*(1-gamma)^t  (Seed-Korrektur w[0]=beta*src[0])
+  out[0] = src[0];  out[t] = alpha*e_src[t] + (1-alpha)*w[t-1]   (t>=1)
+
   * MAType = TradingView-konformer 12er-Satz in exakter Reihenfolge:
     SMA, EMA, WMA, DEMA, TEMA, HMA, EHMA, ZLEMA, RMA, KAMA, ALMA, VWMA.
-  * Defaults (wie PyTrader MA1): ma_type="EHMA", period=4, alpha_factor=2.0,
-    smoothing=10.
-  * Alpha-MAs (DEMA, TEMA, EHMA): alpha = alpha_factor / (period + 1).
+  * Defaults (PineScript TH Pivot v478): ma_type="EHMA", period=4,
+    alpha_factor=2.0, smoothing=10.
   * VWMA: ohne gueltiges Volumen (fehlend/Null) Fallback auf SMA.
-  * smoothing: optionaler zweiter EMA-Pass ueber die Basis-MA-Serie
-    (alle 12 Typen anwendbar). smoothing > 1 = aktiv
-    (ema_first = EMA(base, span=smoothing); base = EMA(ema_first,
-    alpha=alpha_calc)); smoothing <= 1 = keine Glaettung.
-  * NaN-Handling: Warmup period-1 als NaN; kurze Serien (len < period)
-    liefern komplett NaN statt Crash (Defensiv-Guard, Bugfix 12.08.2026).
+  * smoothing (nur fuer die PineScript-Typen EMA/DEMA/TEMA/EHMA eingebaut;
+    HMA laesst es laut PineScript unberuecksichtigt -> ta.hma direkt):
+      * smoothing <= 1: hma_ema reduziert sich exakt auf EMA(alpha) mit
+        alpha = alpha_factor/(len+1)  (ta.ema(src,1) = src).
+      * smoothing > 1: der gewichtete EMA-Feedback-Filter oben.
+    Fuer die NICHT-PineScript-Typen (SMA, WMA, ZLEMA, RMA, KAMA, ALMA,
+    VWMA) bleibt die optionale Alpha-EMA-Glaettung (PyTrader Vertrag B)
+    erhalten: ema_first = EMA(base, span=smoothing); base =
+    EMA(ema_first, alpha=alpha_calc).
+  * NaN-Handling: Die PineScript-EMA-Familie ist ab Bar 0 definiert
+    (Seed src[0], wie TradingView ta.ema/ta.hma - kein Warmup-NaN).
+    Fenster-Typen (SMA/WMA/ALMA/VWMA) und HMA behalten ihren natuerlichen
+    Warmup; kurze Serien (len < period) liefern komplett NaN statt Crash
+    (Defensiv-Guard, Bugfix 12.08.2026).
 
 Alle 12 MA-Typen sind vektorisiert via NumPy/Pandas. KAMA ist inhärent
 rekursiv (ER-basiert) und laeuft ueber eine kompakte Python-Schleife auf
@@ -78,6 +107,12 @@ MA_TYPES: tuple = (
 # ui/style_picker_widget.py stehen.
 _DEFAULT_BULL_COLOR: str = "#089981"  # Gruen (TradingView-Up)
 _DEFAULT_BEAR_COLOR: str = "#F23645"  # Rot (TradingView-Down)
+
+# USER-REQ (18.08.2026, PARITY): Die 5 Typen der PineScript-Pivot-HMA-
+# Familie enthalten das smoothing bereits in ihrer Definition (hma_ema-
+# Familie); HMA laesst es laut PineScript unberuecksichtigt (ta.hma direkt).
+# Fuer diese Typen wird KEINE generische Alpha-EMA-Glaettung mehr angewandt.
+_PINEPIVOT_TYPES: frozenset = frozenset({"HMA", "EMA", "DEMA", "TEMA", "EHMA"})
 
 # KAMA-Standardkonstanten: period = ER-Periode; fast/slow fest nach
 # Kaufman (2/3 bzw. 2/31).
@@ -165,37 +200,123 @@ def _rma_values(values: np.ndarray, period: int) -> np.ndarray:
 
 
 def _hma_values(values: np.ndarray, period: int) -> np.ndarray:
-    """HMA (Hull): WMA(2*WMA(half) - WMA(len), sqrt(len)).
+    """HMA (Hull) EXAKT wie TradingView `ta.hma` (PineScript TH Pivot v478):
+    WMA(2*WMA(half) - WMA(len), round(sqrt(len))).
 
-    sqrt(len) wird auf eine ungerade Ganzzahl gerundet (min 1).
+    USER-REQ (18.08.2026, PARITY-KORREKTUR): Der aeussere WMA nutzt jetzt
+    `round(sqrt(len))` (TradingView-Formel) statt einer erzwungenen
+    UNGERADEN Ganzzahl - fuer len=4/5/16 war der alte (PyTrader-)Wert um 1
+    daneben (z. B. HMA(4): 3 statt 2) und wich damit sichtbar von
+    TradingView ab.
     """
     if period <= 1:
         return values.astype(float, copy=True)
+    if len(values) < period:
+        return np.full(len(values), np.nan, dtype=float)
     half = max(period // 2, 1)
-    sqrt_period = max(int(np.sqrt(period)), 1)
-    if sqrt_period % 2 == 0:
-        sqrt_period += 1
+    sqrt_period = max(int(round(np.sqrt(period))), 1)
     inner = 2.0 * _wma_values(values, half) - _wma_values(values, period)
     return _wma_values(inner, sqrt_period)
 
 
-def _dema_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
-    """DEMA: 2*EMA_alpha - EMA_alpha(EMA_alpha)."""
-    ema1 = _ema_alpha_values(values, alpha)
-    return 2.0 * ema1 - _ema_alpha_values(ema1, alpha)
+def _hma_ema_values(
+    values: np.ndarray,
+    length: int,
+    smoothing: int,
+    alpha_factor: float,
+) -> np.ndarray:
+    """PineScript `hma_ema` (TH Pivot v478) - vektorisiert, kein Loop.
+
+    Referenz (PineScript):
+      hma_alphaCalc = _alphaFactor / (_len + 1)
+      hma_sum := na(hma_sum[1]) ? _src
+                 : hma_alphaCalc * ta.ema(_src, _smoothing)
+                   + (1 - hma_alphaCalc) * nz(ta.ema(hma_sum[1], _smoothing))
+
+    Vektorisierte Herleitung (Seed-Details, s. Doku im Modul-Header):
+      alpha = alpha_factor/(length+1); beta = 2/(smoothing+1);
+      gamma = beta*alpha
+      e_src[t] = EMA(src, span=smoothing)[t]
+      v = EWM(e_src, alpha=gamma)   (pandas adjust=False: v[0]=e_src[0])
+      w[t] = v[t] + (beta-1)*e_src[0]*(1-gamma)^t
+             (w[0]=beta*e_src[0] = exakter PineScript-Seed von EMA(hma_sum[1]))
+      out[0] = src[0]
+      out[t] = alpha*e_src[t] + (1-alpha)*w[t-1]     (t>=1)
+
+    Mit smoothing <= 1 (ta.ema(src,1)=src) reduziert sich der Filter exakt
+    auf EMA(src, alpha) mit alpha = alpha_factor/(length+1).
+    """
+    n = len(values)
+    if n == 0:
+        return values.astype(float, copy=True)
+    alpha = float(alpha_factor) / (length + 1)
+    smoothing = max(int(smoothing), 1)
+    if smoothing <= 1:
+        return _ema_alpha_values(values, alpha)
+    beta = 2.0 / (smoothing + 1.0)
+    gamma = beta * alpha
+    e_src = _ema_span_values(values, smoothing)
+    # v = EMA(e_src, gamma) mit pandas-Seed v[0]=e_src[0]; Seed-Korrektur
+    # auf den PineScript-Seed w[0]=beta*e_src[0] (Differenz (beta-1)*e_src[0],
+    # abklingend mit (1-gamma)^t).
+    v = np.array(
+        pd.Series(e_src).ewm(alpha=gamma, adjust=False).mean().to_numpy(),
+        dtype=float,
+        copy=True,
+    )
+    if np.isfinite(e_src[0]):
+        v = v + (beta - 1.0) * float(e_src[0]) * np.power(
+            1.0 - gamma, np.arange(n)
+        )
+    result = np.empty(n, dtype=float)
+    result[0] = float(values[0]) if np.isfinite(values[0]) else float(e_src[0])
+    result[1:] = alpha * e_src[1:] + (1.0 - alpha) * v[:-1]
+    return result
 
 
-def _tema_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
-    """TEMA: 3*E1 - 3*E2 + E3."""
-    ema1 = _ema_alpha_values(values, alpha)
-    ema2 = _ema_alpha_values(ema1, alpha)
-    ema3 = _ema_alpha_values(ema2, alpha)
-    return 3.0 * ema1 - 3.0 * ema2 + ema3
+def _hma_dema_values(
+    values: np.ndarray,
+    length: int,
+    smoothing: int,
+    alpha_factor: float,
+) -> np.ndarray:
+    """PineScript `hma_dema` (TH Pivot v478): 2*e1 - e2 auf hma_ema-Basis."""
+    e1 = _hma_ema_values(values, length, smoothing, alpha_factor)
+    e2 = _hma_ema_values(e1, length, smoothing, alpha_factor)
+    return 2.0 * e1 - e2
 
 
-def _ehma_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
-    """EHMA: EMA_alpha(HMA(src, len), len)."""
-    return _ema_alpha_values(_hma_values(values, period), alpha)
+def _hma_tema_values(
+    values: np.ndarray,
+    length: int,
+    smoothing: int,
+    alpha_factor: float,
+) -> np.ndarray:
+    """PineScript `hma_tema` (TH Pivot v478): 3*(e1-e2) + e3 auf hma_ema."""
+    e1 = _hma_ema_values(values, length, smoothing, alpha_factor)
+    e2 = _hma_ema_values(e1, length, smoothing, alpha_factor)
+    e3 = _hma_ema_values(e2, length, smoothing, alpha_factor)
+    return 3.0 * (e1 - e2) + e3
+
+
+def _hma_ehma_values(
+    values: np.ndarray,
+    length: int,
+    smoothing: int,
+    alpha_factor: float,
+) -> np.ndarray:
+    """PineScript `hma_ehma` (TH Pivot v478):
+    hma_ema(2*hma_ema(src, int(len/2)) - hma_ema(src, len), int(sqrt(len/2))).
+
+    Die hma_ema-Stufen verwenden jeweils ihren EIGENEN Stufen-alpha
+    (alpha_factor/(stufen_len+1)); die Stufen-Laengen sind int(_len/2) und
+    int(sqrt(_len/2)) (PineScript-int = truncation, floor fuer positive).
+    """
+    half = max(int(length / 2), 1)
+    sqrt_half = max(int(np.sqrt(length / 2.0)), 1)
+    inner = (2.0 * _hma_ema_values(values, half, smoothing, alpha_factor)
+             - _hma_ema_values(values, length, smoothing, alpha_factor))
+    return _hma_ema_values(inner, sqrt_half, smoothing, alpha_factor)
 
 
 def _zlema_values(values: np.ndarray, period: int) -> np.ndarray:
@@ -329,21 +450,30 @@ class MATemplateEngine:
             source: Preis-Serie (z. B. df['close']).
             ma_type: Einer der 12 MA-Typen (MAType).
             period: MA-Periode (min 1).
-            alpha_factor: Decay-Faktor fuer Alpha-MAs (DEMA/TEMA/EHMA);
-                entfaellt bei KAMA.
+            alpha_factor: Decay-Faktor fuer die PineScript-hma_ema-Familie
+                (EMA/DEMA/TEMA/EHMA); entfaellt bei KAMA.
             volume: Volumen-Serie fuer VWMA (z. B. df['tick_volume']). Fehlt
                 sie oder ist sie Null/NaN, faellt VWMA auf SMA zurueck.
-            smoothing: Optionale Alpha-EMA-Glaettung auf die Basis-MA-Serie
-                (alle 12 Typen anwendbar):
-                  * smoothing > 1 (aktiv): ema_first = EMA(base,
-                    span=smoothing); base = EMA(ema_first, alpha=alpha_calc)
-                    mit alpha_calc = alpha_factor / (period + 1).
-                  * smoothing <= 1: keine Glaettung (Basis-Serie
-                    unveraendert, Default).
+            smoothing: USER-REQ (18.08.2026, PARITY gegen PineScript
+                TH Pivot v478):
+                  * EMA/DEMA/TEMA/EHMA: Smoothing ist IN der Definition
+                    eingebaut (hma_ema-Filter, ta.ema(src, smoothing)).
+                    smoothing <= 1 = keine Glaettung -> exakt
+                    EMA(alpha=alpha_factor/(period+1)).
+                  * HMA: laesst smoothing laut PineScript unberuecksichtigt
+                    (ta.hma direkt).
+                  * Uebrige Typen (SMA/WMA/ZLEMA/RMA/KAMA/ALMA/VWMA):
+                    optionale Alpha-EMA-Glaettung auf die Basis-MA-Serie
+                    (PyTrader Vertrag B): ema_first = EMA(base,
+                    span=smoothing); base = EMA(ema_first,
+                    alpha=alpha_calc) mit alpha_calc =
+                    alpha_factor/(period+1). smoothing > 1 = aktiv.
 
         Returns:
-            pd.Series mit demselben Index wie `source`; die ersten
-            `period - 1` Werte sind NaN (Warmup).
+            pd.Series mit demselben Index wie `source`. Die PineScript-EMA-
+            Familie ist ab Bar 0 definiert (Seed src[0], wie TradingView);
+            Fenster-Typen (SMA/WMA/ALMA/VWMA) und HMA behalten ihren
+            natuerlichen Warmup.
         """
         if source is None:
             return pd.Series(dtype=float)
@@ -355,22 +485,30 @@ class MATemplateEngine:
             return pd.Series(index=src.index, dtype=float)
 
         alpha = float(alpha_factor) / (period_int + 1.0)
+        alpha_factor_f = float(alpha_factor)
+        smoothing_int = max(int(smoothing or 0), 0)
 
         key = str(ma_type or "").strip().upper()
         if key == "SMA":
             result = _sma_values(values, period_int)
         elif key == "EMA":
-            result = _ema_span_values(values, period_int)
+            # PineScript TH Pivot v478: hma_ema (Smoothing eingebaut).
+            result = _hma_ema_values(values, period_int, smoothing_int,
+                                     alpha_factor_f)
         elif key == "WMA":
             result = _wma_values(values, period_int)
         elif key == "DEMA":
-            result = _dema_values(values, period_int, alpha)
+            result = _hma_dema_values(values, period_int, smoothing_int,
+                                      alpha_factor_f)
         elif key == "TEMA":
-            result = _tema_values(values, period_int, alpha)
+            result = _hma_tema_values(values, period_int, smoothing_int,
+                                      alpha_factor_f)
         elif key == "HMA":
+            # PineScript: ta.hma direkt - smoothing wird ignoriert.
             result = _hma_values(values, period_int)
         elif key == "EHMA":
-            result = _ehma_values(values, period_int, alpha)
+            result = _hma_ehma_values(values, period_int, smoothing_int,
+                                      alpha_factor_f)
         elif key == "ZLEMA":
             result = _zlema_values(values, period_int)
         elif key == "RMA":
@@ -392,11 +530,12 @@ class MATemplateEngine:
                 f"Unbekannter MA-Typ '{ma_type}'. Gueltig: {MA_TYPES}"
             )
 
-        # Optionale Alpha-EMA-Glaettung (PyTrader Vertrag B): zweifach
-        # verschachtelte EMA-Filterung auf die Basis-MA-Serie.
-        # smoothing > 1 = aktiv; smoothing <= 1 = keine Glaettung.
-        smoothing_int = max(int(smoothing or 0), 0)
-        if smoothing_int > 1:
+        # Optionale Alpha-EMA-Glaettung NUR fuer die NICHT-PineScript-Typen
+        # (PyTrader Vertrag B). Die 5 PineScript-Typen (HMA/EMA/DEMA/TEMA/
+        # EHMA) enthalten das Smoothing bereits in ihrer Definition bzw.
+        # ignorieren es (HMA) - eine zweite generische Glaettung wuerde vom
+        # TradingView-Verhalten abweichen (USER-REQ 18.08.2026, PARITY).
+        if key not in _PINEPIVOT_TYPES and smoothing_int > 1:
             ema_first = _ema_span_values(result, smoothing_int)
             result = _ema_alpha_values(ema_first, alpha)
 
