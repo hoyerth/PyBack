@@ -46,6 +46,7 @@ from persistent_win import PersistentWindow
 from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from state_manager import StateManager
 from ui.algo_list_panel import AlgoListPanel
+from ui.param_form_widget import ParamFormWidget
 from ui.time_range_widget import TimeRangeWidget
 from ui.window_manager import WindowManager
 from workers.data_sync_worker import DataSyncWorker
@@ -179,20 +180,19 @@ class MainWin(QMainWindow):
         # -- Zeitraum-Zeile (Playground, Phase 1) --------------------------
         self.time_range = TimeRangeWidget()
 
-        # -- Linkes Panel: Algo-Liste (Phase 2) + Parameter-Platzhalter ----
+        # -- Linkes Panel: Algo-Liste (Phase 2) + Parameter-Form (Phase 3) -
         self.algo_panel = AlgoListPanel()
 
-        self.param_placeholder = QLabel("Parameter:\n(Phase 3)")
-        self.param_placeholder.setFrameShape(QFrame.StyledPanel)
-        self.param_placeholder.setMinimumHeight(90)
-        self.param_placeholder.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.param_form = ParamFormWidget()
+        self.param_form.setMinimumHeight(90)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(QLabel("Algo-Liste:"))
         left_layout.addWidget(self.algo_panel, 1)
-        left_layout.addWidget(self.param_placeholder)
+        left_layout.addWidget(QLabel("Parameter:"))
+        left_layout.addWidget(self.param_form)
         left_panel.setLayout(left_layout)
 
         # -- Rechter Bereich: Canvas-Platzhalter (Phase 4: QWebEngineView) --
