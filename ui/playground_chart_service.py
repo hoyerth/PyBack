@@ -151,6 +151,9 @@ class PlaygroundChartService:
         ))
 
         # Algo-Overlays (Phase 5): Linien-Traces ueber die Candles.
+        # Phase 7: Overlay-Dicts koennen zusaetzlich Stil-Attribute tragen:
+        #   render ("line"|"lines+markers"|"markers"), dash, width,
+        #   symbol, size (aus dem StylePickerWidget / LineStyle/MarkerStyle).
         if overlays:
             for ov in overlays:
                 if not isinstance(ov, dict):
@@ -161,14 +164,37 @@ class PlaygroundChartService:
                     continue
                 # Epochs -> Wanduhr-Datetime (naiv, wie bei den Candles).
                 ov_x_dt = pd.to_datetime(list(ov_x), unit="s")
-                fig.add_trace(go.Scatter(
+                mode = str(ov.get("render", "line"))
+                if mode not in ("line", "lines+markers", "markers"):
+                    mode = "line"
+                # Intern "line" -> Plotly-mode "lines" (Plotly kennt kein "line").
+                mode = "lines" if mode == "line" else mode
+                color = str(ov.get("color", "#ff7f0e"))
+                # Bugfix Phase 7: Stil-Attribute werden DIREKT im go.Scatter-
+                # Konstruktor gesetzt (nachtraegliches `trace.line = dict(...)`
+                # uebernahm Plotly nicht zuverlaessig ins HTML). Die Mode-
+                # Pruefung muss nach dem Mapping auf "lines" laufen (frueher
+                # testete sie "line" -> dash/width wurden NIE gesetzt).
+                trace_kwargs = dict(
                     x=ov_x_dt,
                     y=list(ov_y),
                     name=str(ov.get("name", "Overlay")),
-                    mode="lines",
-                    line=dict(color=str(ov.get("color", "#ff7f0e")), width=1.5),
+                    mode=mode,
                     hovertemplate="%{y:.4f}<extra>%{fullData.name}</extra>",
-                ))
+                )
+                if "lines" in mode:
+                    trace_kwargs["line"] = dict(
+                        color=color,
+                        dash=str(ov.get("dash", "solid")),
+                        width=float(ov.get("width", 1.5)),
+                    )
+                if "markers" in mode:
+                    trace_kwargs["marker"] = dict(
+                        color=color,
+                        symbol=str(ov.get("symbol", "circle")),
+                        size=float(ov.get("size", 6)),
+                    )
+                fig.add_trace(go.Scatter(**trace_kwargs))
 
         fig.update_layout(
             template="plotly_dark",

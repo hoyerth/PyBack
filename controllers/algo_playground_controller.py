@@ -48,6 +48,7 @@ from algos.algo_registry import AlgoRegistry
 from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
 from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
+from ui.style_models import collect_style_keys
 from workers.playground_worker import PlaygroundWorker
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
@@ -96,16 +97,34 @@ def _js_add_overlay(trace: dict) -> str:
     Wird per Plotly.addTraces auf der BEREITS GELADENEN Seite ausgefuehrt
     (kein setHtml/kein Seiten-Neuaufbau) -> Zoom/Skala bleiben erhalten.
     x-Epochs werden in Datums-Strings umgewandelt (Datumsachse).
+    Phase 7: Stil-Attribute (dash/width/symbol/size/render) werden wie im
+    HTML-Render gesetzt.
     """
     x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
-    trace_json = json.dumps({
+    mode = str(trace.get("render", "line"))
+    if mode not in ("line", "lines+markers", "markers"):
+        mode = "line"
+    # Intern "line" -> Plotly-mode "lines" (Plotly kennt kein "line").
+    plotly_mode = "lines" if mode == "line" else mode
+    color = trace.get("color", "#ff7f0e")
+    payload: dict = {
         "name": trace.get("name", "Overlay"),
         "x": x_iso,
         "y": trace.get("y", []),
-        "mode": "lines",
-        "line": {"color": trace.get("color", "#ff7f0e"), "width": 1.5},
+        "mode": plotly_mode,
         "hovertemplate": "%{y:.4f}<extra>%{fullData.name}</extra>",
-    })
+    }
+    if mode in ("line", "lines+markers"):
+        line = {"color": color, "width": float(trace.get("width", 1.5))}
+        if trace.get("dash"):
+            line["dash"] = str(trace["dash"])
+        payload["line"] = line
+    if mode in ("markers", "lines+markers"):
+        marker = {"color": color, "size": float(trace.get("size", 6))}
+        if trace.get("symbol"):
+            marker["symbol"] = str(trace["symbol"])
+        payload["marker"] = marker
+    trace_json = json.dumps(payload)
     return (
         "(function(){var gd=document.querySelector('.plotly-graph-div');"
         "if(!gd||typeof Plotly==='undefined')return;"
@@ -125,11 +144,22 @@ def _js_remove_overlay(idx: int) -> str:
 def _js_update_overlay(idx: int, trace: dict) -> str:
     """Baut JS zum Aktualisieren eines Overlay-Trace per Index (restyle)."""
     x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
-    payload = json.dumps({"x": x_iso, "y": trace.get("y", [])})
+    payload: dict = {"x": x_iso, "y": trace.get("y", [])}
+    if trace.get("render") in ("line", "lines+markers"):
+        line = {"width": float(trace.get("width", 1.5))}
+        if trace.get("dash"):
+            line["dash"] = str(trace["dash"])
+        payload["line"] = line
+    if trace.get("render") in ("markers", "lines+markers"):
+        marker = {"size": float(trace.get("size", 6))}
+        if trace.get("symbol"):
+            marker["symbol"] = str(trace["symbol"])
+        payload["marker"] = marker
+    payload_json = json.dumps(payload)
     return (
         "(function(){var gd=document.querySelector('.plotly-graph-div');"
         "if(!gd||typeof Plotly==='undefined')return;"
-        f"if({idx}<(gd.data||[]).length)Plotly.restyle(gd,{payload},{idx});}})()"
+        f"if({idx}<(gd.data||[]).length)Plotly.restyle(gd,{payload_json},{idx});}})()"
     )
 
 
@@ -806,10 +836,20 @@ class AlgoPlaygroundController(QObject):
         generation = self._overlay_generation.get(instance_key, 0) + 1
         self._overlay_generation[instance_key] = generation
 
+        # Phase 7: Darstellungs-Keys (line_color/line_style/line_width bzw.
+        # marker_*) sind KEINE Fach-Parameter – sie steuern nur das Zeichnen
+        # und duerfen nicht an die Algo-Klasse gereicht werden (die kennt sie
+        # nicht). Die Instanzierung bleibt damit exakt auf den Fach-Parametern.
+        schema = (entry.get("schema") or {})
+        algo_params = {
+            k: v for k, v in (self.instance_params.get(instance_key) or {}).items()
+            if k not in collect_style_keys(schema)
+        }
+
         worker = PlaygroundWorker(
             entry["class"],
             instance_key,
-            self.instance_params.get(instance_key) or {},
+            algo_params,
             self._candles_cache,
             generation=generation,
             parent=self,
@@ -857,11 +897,58 @@ class AlgoPlaygroundController(QObject):
             worker.deleteLater()
 
     def _color_for_instance(self, instance_key: str) -> str:
-        """Weist einer Instanz eine stabile Overlay-Farbe zu (Farbzyklus)."""
+        """Weist einer Instanz eine stabile Overlay-Farbe zu (Farbzyklus).
+
+        Phase 7: Nur FALLBACK – wenn die Instanz keine Stil-Params besitzt
+        (z. B. alte gespeicherte States ohne line_color/marker_color).
+        """
         if instance_key not in self._overlay_colors:
             idx = len(self._overlay_colors) % len(OVERLAY_COLORS)
             self._overlay_colors[instance_key] = OVERLAY_COLORS[idx]
         return self._overlay_colors[instance_key]
+
+    def _style_for_instance(self, instance_key: str) -> dict:
+        """Stil-Attribute einer Instanz aus instance_params (Phase 7).
+
+        Liest die flach persistierten Stil-Params des AlgOS:
+          line_color/line_style/line_width  (style_type='line')
+          marker_color/marker_symbol/marker_size (style_type='marker')
+        Fehlt eine Farbe (alte States), faellt die Instanz auf den stabilen
+        Farbzyklus zurueck (Abwaertskompatibilitaet).
+
+        Returns:
+            dict mit color (+ optional dash/width/symbol/size).
+        """
+        params = self.instance_params.get(instance_key) or {}
+        color = (params.get("line_color")
+                 or params.get("marker_color")
+                 or self._color_for_instance(instance_key))
+        style: Dict[str, Any] = {"color": color}
+        if params.get("line_style"):
+            style["dash"] = str(params["line_style"])
+        if params.get("line_width") is not None:
+            style["width"] = float(params["line_width"])
+        if params.get("marker_symbol"):
+            style["symbol"] = str(params["marker_symbol"])
+        if params.get("marker_size") is not None:
+            style["size"] = float(params["marker_size"])
+        return style
+
+    def _render_mode_for_result(self, algo_id: str, name: str) -> str:
+        """Render-Modus eines Ergebnis-Feldes (Phase 7).
+
+        result_schema[field]['store']:
+          'series' (Durchgehende Linie) -> "line"
+          'agg'    (Signal je Lauf, KEINE Linie) -> "markers"
+        Optionales 'render'-Feld im result_schema ueberschreibt den Modus
+        ("line"|"lines+markers"|"markers"). Default: "line".
+        """
+        entry = self.registry.get(algo_id) or {}
+        rs = (entry.get("result_schema") or {}).get(name) or {}
+        mode = rs.get("render")
+        if mode in ("line", "lines+markers", "markers"):
+            return mode
+        return "markers" if rs.get("store") == "agg" else "line"
 
     def _build_instance_traces(self, instance_key: str) -> List[dict]:
         """Baut die Overlay-Trace-Dicts EINER Instanz (Zeitraum-Slice).
@@ -869,6 +956,8 @@ class AlgoPlaygroundController(QObject):
         Pro Ergebnis-Feld der Instanz ein Trace mit eindeutigem "key"
         ("instance_key::name") – wird fuer den initialen HTML-Render und die
         inkrementellen JS-Aenderungen (add/remove/update) verwendet.
+        Phase 7: Farbe/Linienart/Staerke/Symbol kommen aus den Stil-Params
+        der Instanz; der Render-Modus aus dem result_schema.
         """
         panel = self.ui.algo_panel
         keys = panel.instance_keys()
@@ -879,7 +968,7 @@ class AlgoPlaygroundController(QObject):
         overlays = self._overlays.get(instance_key)
         if not overlays:
             return []
-        color = self._color_for_instance(instance_key)
+        style = self._style_for_instance(instance_key)
         from_epoch, to_epoch = self.ui.time_range.get_range()
         traces: List[dict] = []
         for name, series in overlays.items():
@@ -891,13 +980,23 @@ class AlgoPlaygroundController(QObject):
             s = series.loc[mask]
             if s.empty:
                 continue
-            traces.append({
+            trace = {
                 "key": f"{instance_key}::{name}",
                 "name": f"{algo_id} ({name})",
                 "x": s.index.tolist(),   # Epoch-Ints (HTML/JS-Konvertierung)
                 "y": s.tolist(),
-                "color": color,
-            })
+                "color": style["color"],
+                "render": self._render_mode_for_result(algo_id, name),
+            }
+            if "dash" in style:
+                trace["dash"] = style["dash"]
+            if "width" in style:
+                trace["width"] = style["width"]
+            if "symbol" in style:
+                trace["symbol"] = style["symbol"]
+            if "size" in style:
+                trace["size"] = style["size"]
+            traces.append(trace)
         return traces
 
     def _build_overlay_traces(self, checked: Dict[str, bool]) -> List[dict]:

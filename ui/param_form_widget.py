@@ -8,6 +8,12 @@ Generiert aus dem `parameter_schema` eines AlgOS dynamisch die Eingabe-Widgets
   * float -> QDoubleSpinBox
   * bool  -> QCheckBox
   * choice/str mit options -> QComboBox
+  * color -> StylePickerWidget (Phase 7, aus PyTrader uebernommen):
+             kompakter Button -> modaler Dialog (Farbe + Linienart + Staerke
+             bzw. Symbol + Groesse). Nur der color-Key wird gerendert; die
+             Sibling-Keys (Konvention: 'color' -> 'style'/'width' bei line,
+             'symbol'/'size' bei marker) liegen als "hidden": True im Schema
+             und werden ueber das Style-Objekt mitgesetzt.
 
 Schema-Format (je Algo unter dem Header-Docstring):
     parameter_schema = {
@@ -17,6 +23,13 @@ Schema-Format (je Algo unter dem Header-Docstring):
         "use_close": {"type": "bool",   "default": True},
         "mode":      {"type": "choice", "default": "ema",
                       "options": ["sma", "ema", "wma"]},
+        "line_color": {"type": "color", "default": "#ff7f0e",
+                       "style_type": "line", "allow_alpha": True},
+        "line_style": {"type": "choice", "default": "solid",
+                       "options": ["solid", "dot", "dash", "longdash",
+                                   "dashdot", "longdashdot"], "hidden": True},
+        "line_width": {"type": "int", "default": 2, "min": 1, "max": 10,
+                       "hidden": True},
     }
 
 Verhalten:
@@ -42,6 +55,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ui.style_models import (
+    LINE_STYLES,
+    PLOTLY_SYMBOLS,
+    LineStyle,
+    MarkerStyle,
+    style_sibling_keys,
+)
+from ui.style_picker_widget import StylePickerWidget
 
 # Default-Ranges fuer SpinBoxen (wenn Schema kein min/max angibt).
 _INT_RANGE: tuple = (1, 1_000_000)
@@ -99,6 +121,11 @@ class ParamFormWidget(QWidget):
         self._schema = dict(schema or {})
 
         for name, spec in self._schema.items():
+            # Phase 7: Sibling-Keys eines color-Params (style/width bzw.
+            # symbol/size) werden NICHT als eigene Controls gerendert –
+            # sie stecken im StylePickerWidget des color-Keys.
+            if spec.get("hidden"):
+                continue
             widget = self._create_control(name, spec)
             label = str(spec.get("label") or name)
             self._form.addRow(f"{label}:", widget)
@@ -108,14 +135,33 @@ class ParamFormWidget(QWidget):
         self._scroll.setVisible(has_fields)
 
     def get_params(self) -> Dict[str, Any]:
-        """Liest die aktuellen Werte aller Controls als dict."""
+        """Liest die aktuellen Werte aller Controls als dict.
+
+        Phase 7: color-Params liefern Farbe + Sibling-Keys (style/width bzw.
+        symbol/size) aus dem StylePickerWidget; hidden-Siblings werden dort
+        mitgeschrieben und hier uebersprungen.
+        """
         params: Dict[str, Any] = {}
         for name, spec in self._schema.items():
+            if spec.get("hidden"):
+                continue  # wird vom color-Control mitgeschrieben
             widget = self._controls.get(name)
             if widget is None:
                 continue
             ctype = str(spec.get("type", "int")).lower()
-            if ctype == "bool":
+            if ctype == "color":
+                style = widget.get_style()
+                style_type = str(spec.get("style_type", "line"))
+                params[name] = style.color
+                if not spec.get("color_only"):
+                    sib1, sib2 = self._style_sibling_keys(name, style_type)
+                    if sib1 and sib1 in self._schema:
+                        params[sib1] = (style.style if style_type == "line"
+                                        else style.symbol)
+                    if sib2 and sib2 in self._schema:
+                        params[sib2] = (style.width if style_type == "line"
+                                        else style.size)
+            elif ctype == "bool":
                 params[name] = widget.isChecked()
             elif ctype == "float":
                 params[name] = widget.value()
@@ -127,14 +173,20 @@ class ParamFormWidget(QWidget):
         return params
 
     def set_params(self, params: Optional[Dict[str, Any]]) -> None:
-        """Setzt Werte programmatisch (OHNE params_changed-Signal)."""
+        """Setzt Werte programmatisch (OHNE params_changed-Signal).
+
+        Phase 7: color-Params bauen das Style-Objekt aus Farbe + Siblings.
+        """
         self._updating = True
         try:
             for name, value in (params or {}).items():
                 widget = self._controls.get(name)
                 if widget is None:
                     continue
-                if isinstance(widget, QCheckBox):
+                if isinstance(widget, StylePickerWidget):
+                    widget.set_style(self._style_from_params(name, value,
+                                                             params or {}))
+                elif isinstance(widget, QCheckBox):
                     widget.setChecked(bool(value))
                 elif isinstance(widget, QComboBox):
                     idx = widget.findData(value)
@@ -158,8 +210,24 @@ class ParamFormWidget(QWidget):
         ctype = str(spec.get("type", "int")).lower()
         default = spec.get("default")
 
-        if ctype == "bool":
-            widget: QWidget = QCheckBox()
+        if ctype == "color":
+            # Phase 7: StylePickerWidget (Button -> Dialog) - Farbe plus
+            # Linienart/Staerke (line) bzw. Symbol/Groesse (marker).
+            style_type = str(spec.get("style_type", "line"))
+            color_only = bool(spec.get("color_only", False))
+            show_visibility = bool(spec.get("show_visibility", True))
+            allow_alpha = bool(spec.get("allow_alpha", True))
+            color = str(default) if default else "#ff7f0e"
+            if style_type == "marker":
+                style_obj: Any = MarkerStyle(color=color)
+            else:
+                style_obj = LineStyle(color=color)
+            widget: QWidget = StylePickerWidget(
+                style=style_obj, style_type=style_type,
+                color_only=color_only, show_visibility=show_visibility,
+                enable_alpha=allow_alpha)
+        elif ctype == "bool":
+            widget = QCheckBox()
             widget.setChecked(bool(default))
         elif ctype == "float":
             widget = QDoubleSpinBox()
@@ -194,7 +262,9 @@ class ParamFormWidget(QWidget):
 
     def _wire(self, widget: QWidget) -> None:
         """Verbindet Nutzer-Aenderungen mit dem params_changed-Signal."""
-        if isinstance(widget, QCheckBox):
+        if isinstance(widget, StylePickerWidget):
+            widget.style_changed.connect(self._on_user_change)
+        elif isinstance(widget, QCheckBox):
             widget.toggled.connect(self._on_user_change)
         elif isinstance(widget, QComboBox):
             widget.currentIndexChanged.connect(self._on_user_change)
@@ -202,6 +272,45 @@ class ParamFormWidget(QWidget):
             widget.valueChanged.connect(self._on_user_change)
         else:
             widget.valueChanged.connect(self._on_user_change)
+
+    # ------------------------------------------------------------------
+    # Phase 7: Style-Sibling-Konvention (wie PyTrader indicator_dialog)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _style_sibling_keys(key: str, style_type: str) -> tuple:
+        """Leitet die Sibling-Keys eines color-Params her (Phase 7).
+
+        Delegiert an die zentrale Konvention in ui/style_models.py
+        (style_sibling_keys), damit Controller + Worker dieselbe Logik
+        nutzen.
+        """
+        return style_sibling_keys(key, style_type)
+
+    def _style_from_params(self, name: str, color: Any,
+                           params: Dict[str, Any]):
+        """Baut das LineStyle/MarkerStyle aus color + Siblings (set_params)."""
+        spec = self._schema.get(name, {})
+        style_type = str(spec.get("style_type", "line"))
+        sib1, sib2 = self._style_sibling_keys(name, style_type)
+        if style_type == "marker":
+            style = MarkerStyle(color=str(color))
+            if sib1 and params.get(sib1) in PLOTLY_SYMBOLS:
+                style.symbol = str(params[sib1])
+            if sib2:
+                try:
+                    style.size = int(params[sib2])
+                except (TypeError, ValueError):
+                    pass
+            return style
+        style = LineStyle(color=str(color))
+        if sib1 and params.get(sib1) in LINE_STYLES:
+            style.style = str(params[sib1])
+        if sib2:
+            try:
+                style.width = int(params[sib2])
+            except (TypeError, ValueError):
+                pass
+        return style
 
     def _on_user_change(self, *_args: Any) -> None:
         """Nutzer hat einen Wert geaendert -> Signal (nicht bei set_params)."""

@@ -24,6 +24,18 @@ class AlgoPlugin:
                    "label": "Periode"},
         "use_close": {"type": "bool", "default": True,
                       "label": "Close verwenden"},
+        # -- Darstellung (Phase 7, Defaults in der Definition) -------------
+        # Nur line_color wird als StylePickerWidget gerendert; die Sibling-
+        # Keys (line_style/line_width) sind hidden und stecken im Widget.
+        "line_color": {"type": "color", "default": "#ff7f0e",
+                       "label": "Farbe", "style_type": "line",
+                       "allow_alpha": True},
+        "line_style": {"type": "choice", "default": "solid",
+                       "options": ["solid", "dot", "dash", "longdash",
+                                   "dashdot", "longdashdot"],
+                       "hidden": True},
+        "line_width": {"type": "int", "default": 2, "min": 1, "max": 10,
+                       "hidden": True},
     }
 
     # 2) Ergebnis-Felder – in der DB gespeichert (store: series|agg|both)
