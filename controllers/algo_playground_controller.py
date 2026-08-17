@@ -14,6 +14,9 @@ berechnet und als farbige Linien ueber die Candles gelegt (Checkbox ein/aus).
 USER-REQ (17.08.2026): NUR RAM-Berechnung + Plot (keine DB-Persistenz,
 AlgoResultsRepository folgt in einer spaeteren Phase); der "+"-Dialog ist
 eine einfache Liste, Klick uebernimmt den Algo als UNCHECKED Instanz.
+Phase 6-Ergaenzung: der aktuelle Plotly-View (Zoom/Skala, x/y-Range) wird
+mit dem Fensterzustand gespeichert und beim Neustart wieder angewendet;
+bei Checkbox-/Param-Aenderungen bleibt der Zoom erhalten (Kontinuitaet).
 
 Verantwortlich (SRP/IoC):
   * Registry einmalig laden (AlgoRegistry.discover_algos)
@@ -28,11 +31,12 @@ Der Controller kennt main_win NICHT als Modul – er erhaelt das View-Objekt
 (duck-typed) ueber den Konstruktor.
 """
 
+import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from PySide6.QtCore import QObject, QTimer, QUrl
+from PySide6.QtCore import QEventLoop, QObject, QTimer, QUrl
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
@@ -43,6 +47,60 @@ from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
 PLAYGROUND_STATE_KEY = "playground_state"
+
+# Phase 6: JS-Snippet zum Auslesen des aktuellen Plotly-Views (Zoom/Skala).
+# Liefert den sichtbaren Ausschnitt aus _fullLayout: xrange (Datumsachse,
+# als ISO-Strings) und yrange (Preisachse, als Zahlen) – exakt das, was
+# Plotly nach einem Zoom/Pan intern haelt. Autorange ist dabei bereits in
+# konkrete Ranges aufgeloest.
+_JS_READ_VIEW = """
+(function(){
+  var gd = document.querySelector('.plotly-graph-div');
+  if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return null;
+  function toISO(v) {
+    return (v && typeof v.toISOString === 'function') ? v.toISOString() : v;
+  }
+  var xr = gd._fullLayout.xaxis.range;
+  var yr = gd._fullLayout.yaxis.range;
+  return {
+    xrange: (xr && xr.length === 2) ? [toISO(xr[0]), toISO(xr[1])] : null,
+    yrange: (yr && yr.length === 2) ? [toISO(yr[0]), toISO(yr[1])] : null
+  };
+})()
+"""
+
+
+def _js_apply_view(view: dict) -> str:
+    """Baut das JS zum Anwenden eines gespeicherten Plotly-Views.
+
+    Pollt (50ms, max. 120 Versuche = 6s), bis die Plotly-Seite nach dem
+    setHtml bereit ist, und setzt dann per Plotly.relayout den sichtbaren
+    x/y-Ausschnitt (ISO-Strings funktionieren direkt fuer die Datumsachse).
+    """
+    payload = json.dumps({
+        "xrange": view.get("xrange"),
+        "yrange": view.get("yrange"),
+    })
+    return f"""
+(function() {{
+  var state = {payload};
+  var tries = 0;
+  var t = setInterval(function() {{
+    tries += 1;
+    var gd = document.querySelector('.plotly-graph-div');
+    if (gd && gd._fullLayout && gd._fullLayout.xaxis &&
+        typeof Plotly !== 'undefined') {{
+      clearInterval(t);
+      var upd = {{}};
+      if (state.xrange) upd['xaxis.range'] = state.xrange;
+      if (state.yrange) upd['yaxis.range'] = state.yrange;
+      if (upd['xaxis.range'] || upd['yaxis.range']) Plotly.relayout(gd, upd);
+    }} else if (tries > 120) {{
+      clearInterval(t);
+    }}
+  }}, 50);
+}})()
+"""
 
 
 class AlgoPlaygroundController(QObject):
@@ -74,6 +132,9 @@ class AlgoPlaygroundController(QObject):
         self._overlays: Dict[str, Dict[str, pd.Series]] = {}
         # Stabile Overlay-Farbe je Instanz (Farbzyklus, Phase 5.3).
         self._overlay_colors: Dict[str, str] = {}
+        # Phase 6: gespeicherter Plotly-View (Zoom/Skala), der nach dem
+        # naechsten Render angewendet werden soll (Restore/Kontinuitaet).
+        self._pending_view: Optional[dict] = None
         # Debounce (300ms, Konzept 2.2): nur der betroffene Algo wird
         # nach Parameter-Aenderung neu berechnet (kurze Wartezeit, damit
         # schnelles Eintippen nicht jede Zwischenstufe berechnet).
@@ -205,8 +266,9 @@ class AlgoPlaygroundController(QObject):
         """Persistiert den kompletten Playground-Zustand (Anforderung 0).
 
         Gespeichert werden: Algo-Liste (algo_id, instance_key, Checkbox),
-        Parameter je Instanz, selektierte Instanz, Zeitraum (Von/Bis) und
-        beide Splitter-Positionen (horizontal + vertikal im linken Panel).
+        Parameter je Instanz, selektierte Instanz, Zeitraum (Von/Bis),
+        beide Splitter-Positionen (horizontal + vertikal im linken Panel)
+        und der aktuelle Plotly-View (Zoom/Skala, Phase 6-Ergaenzung).
         Abgelegt unter global_settings/playground_state (StateManager).
         """
         panel = self.ui.algo_panel
@@ -229,6 +291,8 @@ class AlgoPlaygroundController(QObject):
             "time_range": [int(from_epoch), int(to_epoch)],
             "splitter_main": [int(x) for x in self.ui.splitter.sizes()],
             "splitter_left": [int(x) for x in self.ui.left_splitter.sizes()],
+            # Phase 6: aktueller Plotly-View (Zoom/Skala) fuer den Neustart.
+            "view": self._capture_view(),
         }
         self.ui.state_manager.save_global_value(PLAYGROUND_STATE_KEY, state)
 
@@ -302,6 +366,14 @@ class AlgoPlaygroundController(QObject):
                 except (TypeError, ValueError):
                     pass
 
+        # -- Plotly-View (Phase 6-Ergaenzung) ----------------------------
+        # Gespeicherten Zoom/Skala merken; angewendet wird er erst beim
+        # ersten Render MIT Daten (refresh_chart nach restore_state), damit
+        # die leere/initiale Seite nicht den View auf ein Nichts legt.
+        view = data.get("view")
+        if isinstance(view, dict) and (view.get("xrange") or view.get("yrange")):
+            self._pending_view = view
+
     # ------------------------------------------------------------------
     # Canvas (Phase 4: Candlestick + Zeitraum-Slice, Konzept 2.4)
     # ------------------------------------------------------------------
@@ -319,13 +391,16 @@ class AlgoPlaygroundController(QObject):
         """
         self._load_candles(force_reload=force_reload)
         # Phase 5: Datenkontext geaendert -> ALLE Overlays neu berechnen
-        # (neue Kerzen koennen neue Overlay-Werte liefern) + DB aktualisieren.
+        # (neue Kerzen koennen neue Overlay-Werte liefern), RAM-only.
         self._recalc_all_overlays()
         if force_reload:
             # Nach einem Sync: sichtbaren Bereich bis zur neuesten Kerze
             # erweitern, damit die neuen Daten auch angezeigt werden.
             self._extend_range_to_latest()
-        self._render_chart()
+        # Neuer Datenkontext -> alten Zoom nicht konservieren (der Zeitraum
+        # bzw. die neuen Daten sind jetzt massgebend; ein via restore_state
+        # gesetzter _pending_view wird trotzdem angewendet).
+        self._render_chart(preserve_view=False)
 
     def _load_candles(self, force_reload: bool = False) -> None:
         """Laedt OHLCV-Kerzen (einmalig pro (Symbol, TF) oder erzwungen).
@@ -382,11 +457,24 @@ class AlgoPlaygroundController(QObject):
         self.refresh_chart()
 
     def _on_range_changed(self, *_args) -> None:
-        """Zeitraum geaendert: nur Slicen + rendern (Cache bleibt)."""
-        self._render_chart()
+        """Zeitraum geaendert: nur Slicen + rendern (Cache bleibt).
 
-    def _render_chart(self) -> None:
+        Der Zeitraum-Picker ist jetzt massgebend -> keinen alten Zoom
+        konservieren (sonst wuerde der Chart zurueck auf den alten
+        Ausschnitt springen).
+        """
+        self._render_chart(preserve_view=False)
+
+    def _render_chart(self, preserve_view: bool = True) -> None:
         """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View.
+
+        Args:
+            preserve_view: True (Default) -> der aktuelle Plotly-Zoom/Skala
+                wird VOR dem Re-Render gelesen und danach wieder angewendet,
+                damit Checkbox-/Param-Aenderungen die Ansicht nicht
+                zuruecksetzen. False -> keine Kontinuitaet (z. B. Zeitraum
+                oder Symbol/TF gewechselt); ein via restore_state gesetzter
+                _pending_view wird in jedem Fall angewendet (Phase 6).
 
         Die setHtml-BaseUrl zeigt auf das assets/-Verzeichnis, damit die
         lokale plotly.min.js-Datei geladen werden kann (Bugfix 17.08.2026:
@@ -395,6 +483,12 @@ class AlgoPlaygroundController(QObject):
         canvas = getattr(self.ui, "canvas", None)
         if canvas is None:
             return  # kein Canvas (z.B. Tests mit FakeView)
+
+        # Phase 6: Zoom-Kontinuitaet – aktuellen View sichern (falls gewuenscht).
+        if preserve_view:
+            current = self._capture_view()
+            if current is not None:
+                self._pending_view = current
 
         symbol = getattr(self.ui, "current_symbol", lambda: "?")()
         timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
@@ -412,6 +506,69 @@ class AlgoPlaygroundController(QObject):
                                   "..", "assets")
         canvas.setHtml(html, QUrl.fromLocalFile(
             os.path.normpath(assets_dir).replace("\\", "/") + "/"))
+
+        # Phase 6: gespeicherten/aktuellen View nach dem Render anwenden.
+        # Nur bei vorhandenen Daten (leere Seite hat kein Plotly-Div);
+        # sonst bleibt _pending_view fuer den naechsten Render erhalten.
+        if self._pending_view is not None and self._candles_cache is not None \
+                and not self._candles_cache.empty:
+            self._apply_view(self._pending_view)
+            self._pending_view = None
+
+    # ------------------------------------------------------------------
+    # Phase 6: Plotly-View (Zoom/Skala) lesen + anwenden
+    # ------------------------------------------------------------------
+    def _capture_view(self) -> Optional[dict]:
+        """Liest den aktuellen Plotly-View (x/y-Range) synchron aus dem Canvas.
+
+        runJavaScript ist asynchron -> QEventLoop + Timeout (800ms), damit
+        save_state/_render_chart den Wert sofort haben. Ohne Canvas/Page
+        oder ohne gerendertes Plot -> None (Tests, leerer Canvas).
+        """
+        canvas = getattr(self.ui, "canvas", None)
+        page = getattr(canvas, "page", None)
+        if page is None or not callable(page):
+            return None  # z. B. CanvasStub in Tests
+        try:
+            qpage = page()
+        except Exception:
+            return None
+        if qpage is None:
+            return None
+
+        result: Dict[str, Any] = {"view": None}
+        loop = QEventLoop()
+        try:
+            def _cb(value: Any) -> None:
+                result["view"] = value
+                loop.quit()
+
+            qpage.runJavaScript(_JS_READ_VIEW, _cb)
+            # Sicherheits-Timeout (z. B. Seite noch am Laden).
+            QTimer.singleShot(800, loop.quit)
+            loop.exec()
+        except Exception as exc:
+            print(f"WARN [Playground] View-Lesen fehlgeschlagen: {exc}")
+            return None
+        view = result["view"]
+        if isinstance(view, dict) and (view.get("xrange") or view.get("yrange")):
+            return view
+        return None
+
+    def _apply_view(self, view: Optional[dict]) -> None:
+        """Wendet einen gespeicherten Plotly-View nach dem Render an (Phase 6)."""
+        if not view:
+            return
+        canvas = getattr(self.ui, "canvas", None)
+        page = getattr(canvas, "page", None)
+        if page is None or not callable(page):
+            return  # kein echtes QWebEngineView (z. B. Tests)
+        try:
+            qpage = page()
+            if qpage is not None:
+                qpage.runJavaScript(_js_apply_view(view))
+        except Exception as exc:
+            print(f"WARN [Playground] View-Anwenden fehlgeschlagen: {exc}")
 
     # ------------------------------------------------------------------
     # Phase 5: Overlays (Berechnung, Farben, DB-Persistenz, Debounce)
