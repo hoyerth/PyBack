@@ -41,6 +41,7 @@ from data_sync.mt5_sync_service import TF_SECONDS_MAP
 from persistent_win import PersistentWindow
 from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from state_manager import StateManager
+from ui.time_range_widget import TimeRangeWidget
 from ui.window_manager import WindowManager
 from workers.data_sync_worker import DataSyncWorker
 
@@ -117,7 +118,7 @@ class MainWin(QMainWindow):
     # UI-Aufbau
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        """Baut die Top-Zeile (Symbol/TF + Favoriten | Scan + Opt) und das Log."""
+        """Baut die Top-Zeile, Zeitraum-Zeile (Playground) und das Log."""
         # -- Status-Zeile (unter der Top-Zeile) ----------------------------
         self.status_label = QLabel("Status: initialisiere ...")
         self.status_label.setStyleSheet("font-weight: bold; padding: 2px;")
@@ -166,6 +167,9 @@ class MainWin(QMainWindow):
         top_row.addWidget(self.scan_button)
         top_row.addWidget(self.opt_button)
 
+        # -- Zeitraum-Zeile (Playground, Phase 1) --------------------------
+        self.time_range = TimeRangeWidget()
+
         # -- Log-Feld ------------------------------------------------------
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -173,6 +177,7 @@ class MainWin(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addLayout(top_row)
+        layout.addWidget(self.time_range)
         layout.addWidget(self.status_label)
         layout.addWidget(self.log)
 
