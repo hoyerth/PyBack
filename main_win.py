@@ -195,7 +195,8 @@ class MainWin(QMainWindow):
         algo_pane = QWidget()
         algo_layout = QVBoxLayout()
         algo_layout.setContentsMargins(0, 0, 0, 0)
-        algo_layout.addWidget(QLabel("Algo-Liste:"))
+        # Label "Algo-Liste:" entfaellt – der "+"-Button (im AlgoListPanel)
+        # sitzt jetzt oben an seiner Stelle (Anwender-Anforderung).
         algo_layout.addWidget(self.algo_panel, 1)
         algo_pane.setLayout(algo_layout)
 

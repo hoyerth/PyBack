@@ -67,8 +67,9 @@ class AlgoListPanel(QWidget):
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        # "+" oben an Stelle des Labels (Anwender-Anforderung: Label entfaellt).
+        layout.addWidget(self.add_button, 0, Qt.AlignLeft)
         layout.addWidget(self.list_widget, 1)
-        layout.addWidget(self.add_button)
         self.setLayout(layout)
 
     # ------------------------------------------------------------------
