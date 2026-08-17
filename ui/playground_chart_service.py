@@ -253,6 +253,11 @@ class PlaygroundChartService:
                     color=color,
                     dash=str(ov.get("dash", "solid")),
                     width=float(ov.get("width", 1.5)),
+                    # Bugfix 17.08.2026 (SMA-Linie): connectgaps=True
+                    # verhindert sichtbare Luecken/Brueche bei NaN-Warmup
+                    # (erste period-1 Kerzen) und internen NaN-Gaps – die
+                    # Linie bleibt durchgehend im sichtbaren Bereich.
+                    connectgaps=True,
                 )
             if "markers" in mode:
                 trace["marker"] = dict(

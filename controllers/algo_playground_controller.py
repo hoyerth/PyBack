@@ -251,6 +251,16 @@ class AlgoPlaygroundController(QObject):
     # P2#10: nach dieser Idle-Zeit (s) pollen wir den Plotly-View nicht mehr
     # periodisch (nur bei Interaktion lesen; save_state liest explizit).
     VIEW_POLL_IDLE_S = 5.0
+    # Bugfix 17.08.2026 (SMA-Linie unsichtbar, Legende sichtbar):
+    # QWebEngine kann loadFinished bei raschen setHtml-Aufrufen verlieren
+    # (bekanntes Problem, s. playground_chart_service-Kommentar). Bleibt
+    # _page_ready dadurch dauerhaft False, wuerde jede Folge-Figur per
+    # setHtml (Vollreload) statt per Plotly.react angewendet -> die Seite
+    # kann in einem veralteten Zustand haengen (Overlay-Legende da, Linie
+    # fehlt). Der View-Timer (500ms) heilt diesen Zustand: laengere Zeit
+    # kein loadFinished -> Pending-Figur erneut per react anwenden
+    # (idempotent; laeuft still ins Leere, solange Plotly fehlt).
+    SHELL_READY_TIMEOUT_S = 2.5
 
     def __init__(self, view) -> None:
         super().__init__()
@@ -303,6 +313,11 @@ class AlgoPlaygroundController(QObject):
         self._page_ready: bool = False
         self._pending_figure_json: Optional[str] = None
         self._pending_empty: bool = False
+        # Bugfix 17.08.2026 (Self-Heal): Zeitpunkt des letzten setHtml der
+        # Shell. _poll_view wendet die Pending-Figur per react erneut an,
+        # wenn die Seite nach SHELL_READY_TIMEOUT_S immer noch nicht
+        # _page_ready meldet (verlorenes loadFinished in QWebEngine).
+        self._shell_set_at: float = 0.0
         # Bugfix 17.08.2026 (View-Persistenz): 500ms statt 2s – der Zoom
         # ist damit max. 0.5s alt, wenn save_state gelesen wird.
         self._view_timer = QTimer(self)
@@ -886,6 +901,7 @@ class AlgoPlaygroundController(QObject):
             self._pending_figure_json = None
             self._pending_empty = True
             self._shell_set = False
+            self._shell_set_at = 0.0
             self._page_ready = False
             canvas.setHtml(
                 self._chart_service.build_page_html(symbol, timeframe, None),
@@ -900,6 +916,7 @@ class AlgoPlaygroundController(QObject):
             return
         # Seite noch nicht geladen -> Shell (einmalig) setzen.
         self._shell_set = True
+        self._shell_set_at = time.monotonic()
         canvas.setHtml(
             self._chart_service.build_page_html(
                 symbol, timeframe, self._pending_figure_json),
@@ -951,7 +968,22 @@ class AlgoPlaygroundController(QObject):
         P2#10 (Optimierung): Nach VIEW_POLL_IDLE_S ohne Interaktion wird
         nicht mehr gepollt (Idle-Skip) – save_state liest beim Schliessen
         explizit (+ 300ms Event-Pump), daher geht kein Zoom verloren.
+
+        Bugfix 17.08.2026 (Self-Heal, SMA-Linie unsichtbar): QWebEngine
+        verliert bei raschen setHtml-Aufrufen gelegentlich loadFinished.
+        Bleibt _page_ready dadurch False, wendet dieser Timer die
+        Pending-Figur nach SHELL_READY_TIMEOUT_S erneut per Plotly.react
+        an (idempotent; no-op, solange Plotly noch fehlt). Kein setHtml ->
+        keine Reload-Schleife.
         """
+        if self._shell_set and not self._page_ready and \
+                self._pending_figure_json is not None:
+            if time.monotonic() - self._shell_set_at > self.SHELL_READY_TIMEOUT_S:
+                # Seite meldet kein loadFinished -> Pending-Figur erneut per
+                # react anwenden (heilt verlorenes loadFinished in QWebEngine).
+                self._run_js(_js_apply_figure(self._pending_figure_json))
+                self._shell_set_at = time.monotonic()
+
         if time.monotonic() - self._last_interaction > self.VIEW_POLL_IDLE_S:
             return  # Idle: kein Lesen mehr noetig (P2#10)
         self._request_view_read()
