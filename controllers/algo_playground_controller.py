@@ -1249,11 +1249,12 @@ class AlgoPlaygroundController(QObject):
         Phase 7: Farbe/Linienart/Staerke/Symbol kommen aus den Stil-Params
         der Instanz; der Render-Modus aus dem result_schema.
         USER-REQ (17.08.2026, alg_ma dual_color): Ein Overlay-Wert kann ein
-        Tupel (pd.Series, Farbliste je Punkt) sein - der Trace erhaelt dann
-        `line_colors` (Segment-Farben-Array). Bugfix 17.08.2026: statt
-        Segment-Traces mit NaN-Luecken (sichtbare Luecke am high/low an
-        Farbwechseln) nutzt der EINE Trace Plotlys `line.color`-Array
-        (lueckenlos, jede Linien-Segmentfarbe = Farbe ihres Startpunkts).
+        Tupel (pd.Series, Farbliste je Punkt) sein. Bugfix 17.08.2026
+        (plotly v3.7.0 verwirft line.color-ARRAYS fuer scatter, s.u.):
+        die Serie wird in zusammenhaengende Farbbloecke zerlegt
+        (_build_color_run_traces) - jeder Block ist EIN Trace mit expliziter
+        Einzelfarbe (lueckenlos durch geteilte Grenzpunkte, entkoppelt von
+        anderen Overlays/Default-Farbzyklus).
         """
         panel = self.ui.algo_panel
         keys = panel.instance_keys()
@@ -1293,23 +1294,14 @@ class AlgoPlaygroundController(QObject):
                                           self.LOD_MAX_OVERLAY_POINTS).astype(int)
                     s = s.iloc[idx_pos]
                     colors = [colors[i] for i in idx_pos]
-                trace: Dict[str, Any] = {
-                    "key": f"{instance_key}::{name}",
-                    "name": f"{algo_id} ({name})",
-                    "x": s.index.tolist(),   # Epoch-Ints
-                    "y": s.tolist(),
-                    # Bugfix 17.08.2026: line_colors-Array (Plotly faerbt
-                    # jedes Liniensegment mit der Farbe seines Startpunkts)
-                    # statt Segment-Splitting -> KEINE Luecke an Farbwechseln.
-                    "line_colors": [str(c) for c in colors],
-                    "render": "line",
-                    "connectgaps": True,
-                }
-                if "dash" in style:
-                    trace["dash"] = style["dash"]
-                if "width" in style:
-                    trace["width"] = style["width"]
-                traces.append(trace)
+                # Bugfix 17.08.2026 (plotly v3.7.0 verwirft line.color-
+                # ARRAYS fuer scatter in der Calc-Phase -> Default-Farbe je
+                # Trace-Index = Kopplung an andere Overlays): die Serie wird
+                # in zusammenhaengende Farbbloecke zerlegt; jeder Block ist
+                # EIN Trace mit EXPLIZITER Einzelfarbe (geteilter Grenzpunkt
+                # -> lueckenlos, keine Kopplung an den Trace-Index).
+                traces.extend(self._build_color_run_traces(
+                    instance_key, name, algo_id, s, colors, style))
                 continue
             series = value
             # Zeitraum-Slice (Konzept 2.4: Slicen statt Neuladen).
@@ -1343,6 +1335,87 @@ class AlgoPlaygroundController(QObject):
                 trace["size"] = style["size"]
             traces.append(trace)
         return traces
+
+    def _build_color_run_traces(
+        self, instance_key: str, name: str, algo_id: str,
+        s: pd.Series, colors: List[Any], style: Dict[str, Any],
+    ) -> List[dict]:
+        """Zerlegt eine dual_color-Serie in lueckenlose Farbblock-Traces.
+
+        USER-REQ (17.08.2026, alg_ma dual_color): Die MA-Serie traegt eine
+        Pro-Punkt-Farbe (bull/bear). plotly.js v3.7.0 verwirft das
+        `line.color`-ARRAY fuer scatter in der Calc-Phase vollstaendig und
+        faellt auf den Default-Farbzyklus je Trace-INDEX zurueck – dadurch
+        war die Farbe an andere Overlays gekoppelt (SMA an/aus -> andere
+        Farbe) und dual_color zeigte nur EINE Farbe (Bugfix 17.08.2026).
+
+        Loesung: Die Serie wird in zusammenhaengende Farbbloecke (runs)
+        zerlegt; jeder Block ist EIN Trace mit EXPLIZITER Einzelfarbe.
+        Benachbarte Bloecke TEILEN sich den Grenzpunkt (Ende Block k ==
+        Start Block k+1), dadurch bleibt die Linie durchgehend sichtbar –
+        keine NaN-Luecken, kein connectgaps-Gefrickel wie beim frueheren
+        Segment-Splitting (sichtbare Luecke am Farbwechsel).
+
+        USER-REQ (18.08.2026, Farbwechsel ohne Verzoegerung): Ein Segment
+        (Punkt i -> i+1) traegt die Farbe des ZIELpunkts i+1 (= Richtung
+        des Moves i -> i+1). Der Farbwechsel sitzt damit EXAKT an der Bar,
+        an der die Richtung gewechselt hat (keine 1-Bar-Verzoegerung wie bei
+        der alten Startpunkt-Faerbung).
+
+        Vektorisiert (kein Loop ueber Datenpunkte, Agents.md): Die
+        Blockgrenzen werden ueber np.flatnonzero auf den Segment-Farben
+        berechnet.
+
+        Returns:
+            Liste von Trace-Dicts (ein Trace je Farbblock); nur der erste
+            Block hat showlegend=True (keine Legenden-Duplikate).
+        """
+        n = len(s)
+        if n < 2:
+            return []  # 1 Punkt kann keine Linie darstellen
+        colors_str = [str(c) for c in colors]
+        c_arr = np.asarray(colors_str)
+        # USER-REQ (18.08.2026, Farbwechsel ohne Verzoegerung): Segment i
+        # (Punkt i -> i+1) traegt die Farbe des ZIELpunkts i+1 = Richtung
+        # des Moves i -> i+1. Damit erscheint der Farbwechsel EXAKT an der
+        # Bar, an der die Richtung gewechselt hat. Vorher (Farbe von Punkt
+        # i = Richtung des VORHERIGEN Moves) war die Umkehrfarbe 1 Bar zu
+        # spaet sichtbar. Segment-Indizes laufen 0..n-2.
+        seg_colors = c_arr[1:]  # Segment i -> Farbe von Punkt i+1 (len n-1)
+        # Farbwechsel an Segment i, wenn seg_colors[i] != seg_colors[i-1];
+        # alle Wechsel liegen automatisch im gueltigen Segment-Bereich
+        # (1..n-2) – kein Filter noetig.
+        boundaries = np.flatnonzero(seg_colors[1:] != seg_colors[:-1]) + 1
+        # Jeder Block umfasst SEGMENTE mit EINER Farbe: Block k laeuft von
+        # Segment boundaries[k-1] .. boundaries[k]-1 (der Boundary-Segment
+        # startet den NAECHSTEN Block). Punkte des Blocks = a..b+1, der
+        # Endpunkt ist der Start des naechsten Blocks (geteilt -> lueckenlos).
+        starts = np.concatenate(([0], boundaries))
+        ends = np.concatenate((boundaries - 1, [n - 2]))  # Segment-Enden
+        index = s.index
+        values = s.to_numpy()
+        out: List[dict] = []
+        for i, (a, b) in enumerate(zip(starts, ends)):
+            # Punkte a..b+1 (inklusive Endpunkt) – der Endpunkt wird mit
+            # dem naechsten Block geteilt -> die Linie ist durchgehend.
+            pts = np.arange(a, b + 2)
+            trace: Dict[str, Any] = {
+                "key": f"{instance_key}::{name}",
+                "name": f"{algo_id} ({name})",
+                "x": index[pts].tolist(),   # Epoch-Ints (Wanduhr)
+                "y": values[pts].tolist(),
+                "color": colors_str[a + 1],  # Farbe des ZIELpunkts von Seg. a
+                "render": "line",
+                "connectgaps": True,
+                # Nur der erste Block hat einen Legenden-Eintrag.
+                "showlegend": i == 0,
+            }
+            if "dash" in style:
+                trace["dash"] = style["dash"]
+            if "width" in style:
+                trace["width"] = style["width"]
+            out.append(trace)
+        return out
 
     def _build_overlay_traces(self, checked: Dict[str, bool]) -> List[dict]:
         """Baut die sichtbaren Overlay-Traces ALLER Instanzen (fuer HTML).

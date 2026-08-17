@@ -16,8 +16,9 @@ uebernommen - EIN MA-Wert statt 8 (Multi-MA-Referenz `ind_moving_averages`):
   * Overlay-Vertrag: get_overlay_series -> {"ma": pd.Series}; Index =
     candles_df["time"] (Epoch-Int, Wanduhr). Bei dual_color=True wird ein
     Tupel (pd.Series, Farbliste je Punkt) geliefert - der Controller
-    splittet es in Segment-Traces (je Farbblock ein Trace mit NaN-Luecken,
-    connectgaps=False).
+    zerlegt es in lueckenlose Farbblock-Traces (je Farbblock ein Trace mit
+    expliziter Einzelfarbe und geteiltem Grenzpunkt; USER-REQ 18.08.2026:
+    die Segment-Farbe folgt dem ZIELpunkt, Farbwechsel ohne Verzoegerung).
 """
 
 from typing import Optional
@@ -149,7 +150,7 @@ class AlgoPlugin:
         Returns:
             dict - {"ma": pd.Series} mit Index = candles_df["time"].
             Bei dual_color=True: {"ma": (pd.Series, Farbliste je Punkt)} -
-            der Controller splittet das Tupel in Segment-Traces.
+            der Controller zerlegt das Tupel in lueckenlose Farbblock-Traces.
         """
         close = candles_df["close"]
         volume: Optional[pd.Series] = None

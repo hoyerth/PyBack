@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -82,6 +83,42 @@ class _QtStdout(QObject):
 
     def _append(self, text: str) -> None:
         self._log.appendPlainText(text.rstrip("\n"))
+
+
+class _ElidedStatusLabel(QLabel):
+    """Status-Label mit Text-Elision (USER-REQ 18.08.2026).
+
+    Das Label reicht bis zum rechten Rand der Parameterbox (dieselbe Breite
+    wie der linke Panel) und hat KEINEN Scrollbalken. Lange Texte werden
+    mit '…' elidiert statt die Zeile/das Layout aufzublaehen – die
+    SizePolicy.Ignored + MinimumWidth(0) garantieren, dass der
+    minimumSizeHint des Panels konstant bleibt (keine Grafikschiebung).
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self._full_text = text
+        self._shown_text = None  # zuletzt gesetzter elidierter Text
+
+    def setText(self, text: str) -> None:
+        """Speichert den Volltext und elidiert auf die aktuelle Breite."""
+        self._full_text = text
+        self._apply_elide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        """Elidiert den Volltext auf die aktuelle Widget-Breite (vektorisiert
+        ueber QFontMetrics.elidedText; kein Layout-Input -> kein Aufblaehen)."""
+        w = self.width()
+        fm = QFontMetrics(self.font())
+        shown = fm.elidedText(self._full_text, Qt.ElideRight, max(w - 4, 0))
+        if shown != self._shown_text:
+            self._shown_text = shown
+            super().setText(shown)
+            self.setToolTip(self._full_text if shown != self._full_text else "")
 
 
 class MainWin(QMainWindow):
@@ -138,8 +175,17 @@ class MainWin(QMainWindow):
         """Baut die Top-Zeile, Zeitraum-Zeile (Playground), Canvas-Bereich
         und unten die Statuszeile + Log (5 Zeilen hoch)."""
         # -- Status-Zeile (ganz unten, ueber dem Log) ----------------------
-        self.status_label = QLabel("Status: initialisiere ...")
+        # USER-REQ (18.08.2026): Das Status-Label reicht bis zum rechten
+        # Rand der Parameterbox und hat KEINEN Scrollbalken. Laengerer Text
+        # wird mit '…' elidiert (_ElidedStatusLabel) statt die Zeile/den
+        # linken Panel breiter wachsen zu lassen (SizePolicy.Ignored ->
+        # minimumSizeHint bleibt konstant -> keine Grafikschiebung, Bugfix
+        # 17.08.2026 bleibt erhalten; Scrollbalken entfaellt).
+        self.status_label = _ElidedStatusLabel("Status: initialisiere ...")
         self.status_label.setStyleSheet("font-weight: bold; padding: 2px;")
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # -- Top-Zeile: Symbol / Timeframe / Favoriten ---------------------
         self.symbol_combo = QComboBox()
@@ -194,7 +240,8 @@ class MainWin(QMainWindow):
         # und QScrollArea (ParamFormWidget) haben eingebaute Scrollbars.
         self.algo_panel = AlgoListPanel()
         # Statuszeile rechts neben dem "+"-Button (kleiner Abstand).
-        # add_layout = [0] '+' [1] Stretch -> [1] Spacing, [2] Status.
+        # add_layout = [0] '+' [1] Spacing, [2] Status-Label (stretch 1,
+        # reicht bis zum rechten Rand der Parameterbox).
         self.algo_panel.add_layout.insertSpacing(1, 8)
         self.algo_panel.add_layout.insertWidget(2, self.status_label, 1)
         self.param_form = ParamFormWidget()

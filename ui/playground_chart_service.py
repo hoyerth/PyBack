@@ -258,6 +258,7 @@ class PlaygroundChartService:
             }
             if "lines" in mode:
                 line_opts: dict = dict(
+                    color=color,
                     dash=str(ov.get("dash", "solid")),
                     width=float(ov.get("width", 1.5)),
                     # Bugfix 17.08.2026 (SMA-Linie): connectgaps=True
@@ -266,16 +267,6 @@ class PlaygroundChartService:
                     # Linie bleibt durchgehend im sichtbaren Bereich.
                     connectgaps=bool(ov.get("connectgaps", True)),
                 )
-                # Bugfix 17.08.2026 (alg_ma dual_color): line_colors-Array
-                # faerbt jedes Liniensegment mit der Farbe seines Startpunkts
-                # (Plotly scatter.line.color als Liste) -> lueckenloser
-                # Bull/Bear-Verlauf statt Segment-Splitting mit Luecken.
-                line_colors = ov.get("line_colors")
-                if line_colors is not None and isinstance(
-                        line_colors, (list, tuple)) and len(line_colors) > 0:
-                    line_opts["color"] = [str(c) for c in line_colors]
-                else:
-                    line_opts["color"] = color
                 trace["line"] = line_opts
             if "markers" in mode:
                 trace["marker"] = dict(
@@ -283,6 +274,12 @@ class PlaygroundChartService:
                     symbol=str(ov.get("symbol", "circle")),
                     size=float(ov.get("size", 6)),
                 )
+            # Bugfix 17.08.2026 (alg_ma dual_color): Nur der erste
+            # Farbblock-Trace einer Serie hat einen Legenden-Eintrag; die
+            # Folge-Bloecke (showlegend=False) sind reine Farbsegmente und
+            # wuerden sonst die Legende mit Duplikaten fuellen.
+            if ov.get("showlegend") is False:
+                trace["showlegend"] = False
             data.append(trace)
 
         # Dunkles Theme explizit im Layout (kein Template-JSON noetig, haelt

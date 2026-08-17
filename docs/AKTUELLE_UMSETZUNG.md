@@ -259,3 +259,40 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 * `test/check_alg_ma.py` – **alle 10 Checks OK** (inkl. Parity alle 12 MA-Typen gegen PyTrader, line_colors-Array, KeyError-Bugfix).
 * `test/test.py` – komplette Suite **alle Phasen 0–7 OK** (keine Regression).
 * `py_compile` auf allen 3 geaenderten Dateien OK.
+
+---
+
+## Implementierungs-Log: MA-dual_color Farbblock-Traces + Status-Label Fixes (18.08.2026)
+
+> **Anwender-Bugmeldungen (Bugfixing-Modus):**
+> 1. **Farbkopplung & Einfarbig bei dual_color** (plotly.js v3.7.0 verwirft `line.color`-ARRAYS fuer scatter in der Calc-Phase vollstaendig → Default-Farbzyklus je Trace-Index): SMA an/aus aenderte die MA-Farbe; bei dual_color war nur EINE Farbe sichtbar.
+> 2. **Status-Label laengerer Text liess die Zeile/den linken Panel breiter wachsen** → Splitter schob den Canvas (die Grafik) zusammen.
+> 3. **Farbwechsel kommt 1 Bar zu spaet:** Wenn die Richtung gewechselt hat, muss unmittelbar an dieser Stelle die entsprechende Farbe gesetzt sein (aufwaerts gruen, abwaerts rot) – keine Verzoegerung.
+> 4. **Status-Label bis zum rechten Rand der Parameterbox, Scrollbalken wieder weg.**
+
+Alle Fixes vom Anwender als funktionierend bestaetigt.
+
+### Befunde & Fixes
+
+* **Fix #1/#3 (dual_color Farbblock-Traces statt line.color-Array):** plotly.js v3.7.0 verwirft `line.color`-ARRAYS fuer Scatter-Traces in der Calc-Phase (per jsdom-Probe nachgewiesen: `calcdata trace.line.color` wird Einzelfarbe). Der fruehere `line_colors`-Array-Fix (Commit `5ae8b4e`) war damit wirkungslos – Plotly fiel auf den Default-Farbzyklus je Trace-Index zurueck. **Fix:** Neue Methode **`_build_color_run_traces()`** zerlegt die dual_color-Serie in **zusammengehoerige Farbblock-Traces** (vektorisiert via `np.flatnonzero` auf den Segment-Farben), jeder mit **expliziter Einzelfarbe** (`line.color` als String → entkoppelt vom Trace-Index) und **geteiltem Grenzpunkt** (Ende Block k == Start Block k+1 → lueckenlos, kein NaN-Gap). `showlegend` nur im ersten Block (keine Legenden-Duplikate). Der Chart-Service (`ui/playground_chart_service.py`) nutzt die explizite `color` aus dem Trace-Dict; der `line_colors`-Zweig entfaellt.
+* **Fix #3 (Farbwechsel ohne Verzoegerung):** Segment-Semantik in `_build_color_run_traces` umgestellt: Segment i (Punkt i → i+1) traegt jetzt die Farbe des **ZIELpunkts i+1** (= Richtung des Moves i→i+1). Vorher (Farbe von Punkt i = Richtung des VORHERIGEN Moves) erschien die Umkehrfarbe 1 Bar zu spaet. Jetzt sitzt der Farbwechsel **exakt an der Bar, an der die Richtung gewechselt hat**. Blockgrenzen via `np.flatnonzero(seg_colors[1:] != seg_colors[:-1]) + 1` auf den Segment-Farben (alle Wechsel automatisch im gueltigen Segment-Bereich 1..n-2, kein Filter noetig); Block-Farbe = `colors_str[a + 1]` (Zielpunkt des ersten Segments).
+* **Fix #2/#4 (Status-Label bis rechter Rand, kein Scrollbalken):** Die zwischenzeitliche QScrollArea-Loesung wird ersetzt durch **`_ElidedStatusLabel`** (QLabel-Subklasse in `main_win.py`): Das Label liegt mit `stretch 1` in der Add-Zeile des Algo-Panels → **gleiche Breite wie die Parameterbox** (beide Panes im selben vertikalen Splitter). Lange Texte werden via `QFontMetrics.elidedText` mit **'…' elidiert** (Tooltip zeigt den Volltext) – **kein Scrollbalken**, kein Aufblaehen des Layouts (`SizePolicy.Ignored` + `minimumWidth(0)` bleiben, Bugfix 17.08.2026 Grafikschiebung bleibt erhalten). `QScrollArea`/`QFrame`-Imports entfernt.
+
+### Aenderungen
+
+| Datei | Inhalt |
+|-------|--------|
+| `controllers/algo_playground_controller.py` | Neue Methode `_build_color_run_traces` (Farbblock-Traces, explizite Einzelfarbe, geteilter Grenzpunkt, showlegend nur Block 0). Segment-Semantik: Segment i traegt die Farbe des ZIELpunkts i+1 → Farbwechsel EXAKT an der Umkehr-Bar (USER-REQ 18.08.2026). `_build_instance_traces` nutzt die Block-Traces statt `line_colors`-Array. |
+| `ui/playground_chart_service.py` | `line_colors`-Zweig entfernt; `line_opts["color"] = color` (explizit); `showlegend`-Handling fuer Folge-Bloecke ergaenzt (keine Legenden-Duplikate). |
+| `main_win.py` | **`_ElidedStatusLabel`** (QLabel mit Text-Elision via QFontMetrics.elidedText, Tooltip-Volltext) ersetzt die QScrollArea-Loesung. Status-Label mit `stretch 1` → reicht bis zum rechten Rand der Parameterbox; kein Scrollbalken. Ungenutzte Imports `QFrame`/`QScrollArea` entfernt. |
+| `algos/alg_ma.py` | Nur Doku: veraltete NaN-Luecken-Semantik (connectgaps=False) auf lueckenlose Farbblock-Traces (geteilter Grenzpunkt, Zielpunkt-Faerbung) angeglichen. |
+| `test/check_alg_ma.py` | **Neu (lokal, gitignored):** Validator erweitert – 4 Farbblock-Traces (GG/RR/GGG/RR), explizite Einzelfarben, geteilte Grenzpunkte, showlegend nur Block 0, **Farbwechsel-Exakt-Assertion** (Block an Umkehr-Bar Index 2 & 7 ist sofort bear/rot, keine 1-Bar-Verzoegerung). |
+| `test/_gen/probe_status_label.py` | **Neu (lokal, gitignored):** Probe fuer das elidierende Status-Label (Breite = Panelbreite, minSizeHint konstant, keine ScrollArea, Text elidiert). |
+
+### Verifikation (headless, keine UI)
+
+* `test/check_alg_ma.py` – **alle 10 Checks OK** (inkl. Parity alle 12 MA-Typen gegen PyTrader, Farbblock-Traces lueckenlos + Farbwechsel-exakt, Chart-Service explizite Farben, set_params-Bugfix).
+* `test/test.py` – komplette Suite **alle Phasen 0–7 OK** (keine Regression).
+* `test/_gen/probe_status_label.py` – **OK** (Label 150px/200px, minSizeHint Differenz 0, elidiert, kein Scrollbalken).
+* `test/repro_ma_color.py` (jsdom mit echter plotly.min.js v3.7.0) – Exit 0: beide Farben `#089981`/`#F23645` im calcdata, SMA-Toggle-Farb-Signatur identisch (keine Kopplung).
+* `py_compile` auf allen geaenderten Dateien OK.
