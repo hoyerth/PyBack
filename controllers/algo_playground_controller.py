@@ -42,7 +42,11 @@ from PySide6.QtWidgets import QDialog
 from algos.algo_registry import AlgoRegistry
 from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
-from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
+from ui.playground_chart_service import (
+    OVERLAY_COLORS,
+    VIEW_SCRIPT_MARKER,
+    PlaygroundChartService,
+)
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
@@ -70,37 +74,47 @@ _JS_READ_VIEW = """
 """
 
 
-def _js_apply_view(view: dict) -> str:
-    """Baut das JS zum Anwenden eines gespeicherten Plotly-Views.
+def _js_add_overlay(trace: dict) -> str:
+    """Baut JS zum inkrementellen Hinzufuegen eines Overlay-Trace.
 
-    Pollt (50ms, max. 120 Versuche = 6s), bis die Plotly-Seite nach dem
-    setHtml bereit ist, und setzt dann per Plotly.relayout den sichtbaren
-    x/y-Ausschnitt (ISO-Strings funktionieren direkt fuer die Datumsachse).
+    Wird per Plotly.addTraces auf der BEREITS GELADENEN Seite ausgefuehrt
+    (kein setHtml/kein Seiten-Neuaufbau) -> Zoom/Skala bleiben erhalten.
+    x-Epochs werden in Datums-Strings umgewandelt (Datumsachse).
     """
-    payload = json.dumps({
-        "xrange": view.get("xrange"),
-        "yrange": view.get("yrange"),
+    x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
+    trace_json = json.dumps({
+        "name": trace.get("name", "Overlay"),
+        "x": x_iso,
+        "y": trace.get("y", []),
+        "mode": "lines",
+        "line": {"color": trace.get("color", "#ff7f0e"), "width": 1.5},
+        "hovertemplate": "%{y:.4f}<extra>%{fullData.name}</extra>",
     })
-    return f"""
-(function() {{
-  var state = {payload};
-  var tries = 0;
-  var t = setInterval(function() {{
-    tries += 1;
-    var gd = document.querySelector('.plotly-graph-div');
-    if (gd && gd._fullLayout && gd._fullLayout.xaxis &&
-        typeof Plotly !== 'undefined') {{
-      clearInterval(t);
-      var upd = {{}};
-      if (state.xrange) upd['xaxis.range'] = state.xrange;
-      if (state.yrange) upd['yaxis.range'] = state.yrange;
-      if (upd['xaxis.range'] || upd['yaxis.range']) Plotly.relayout(gd, upd);
-    }} else if (tries > 120) {{
-      clearInterval(t);
-    }}
-  }}, 50);
-}})()
-"""
+    return (
+        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "if(!gd||typeof Plotly==='undefined')return;"
+        f"Plotly.addTraces(gd,{trace_json});}})()"
+    )
+
+
+def _js_remove_overlay(idx: int) -> str:
+    """Baut JS zum Entfernen eines Overlay-Trace per Index (deleteTraces)."""
+    return (
+        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "if(!gd||typeof Plotly==='undefined')return;"
+        f"if({idx}<(gd.data||[]).length)Plotly.deleteTraces(gd,{idx});}})()"
+    )
+
+
+def _js_update_overlay(idx: int, trace: dict) -> str:
+    """Baut JS zum Aktualisieren eines Overlay-Trace per Index (restyle)."""
+    x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
+    payload = json.dumps({"x": x_iso, "y": trace.get("y", [])})
+    return (
+        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "if(!gd||typeof Plotly==='undefined')return;"
+        f"if({idx}<(gd.data||[]).length)Plotly.restyle(gd,{payload},{idx});}})()"
+    )
 
 
 class AlgoPlaygroundController(QObject):
@@ -135,6 +149,19 @@ class AlgoPlaygroundController(QObject):
         # Phase 6: gespeicherter Plotly-View (Zoom/Skala), der nach dem
         # naechsten Render angewendet werden soll (Restore/Kontinuitaet).
         self._pending_view: Optional[dict] = None
+        # Zuletzt aus dem Canvas gelesener View (periodischer Timer). Wird
+        # in save_state genutzt, damit beim Schliessen KEIN JS mehr laufen
+        # muss (QEventLoop waehrend closeEvent ist unzuverlaessig).
+        self._last_view: Optional[dict] = None
+        self._view_timer = QTimer(self)
+        self._view_timer.setInterval(2000)
+        self._view_timer.timeout.connect(self._poll_view)
+        self._view_timer.start()
+        # Reihenfolge der AKTUELL im Canvas sichtbaren Overlay-Traces
+        # (Phase 6, USER-REQ: kein Neuaufbau beim Check/Uncheck). Der
+        # Candlestick-Trace liegt immer auf Index 0 -> Overlay-Index =
+        # 1 + Position in dieser Liste (Trace-Key = "instance_key::name").
+        self._overlay_order: List[str] = []
         # Debounce (300ms, Konzept 2.2): nur der betroffene Algo wird
         # nach Parameter-Aenderung neu berechnet (kurze Wartezeit, damit
         # schnelles Eintippen nicht jede Zwischenstufe berechnet).
@@ -205,11 +232,15 @@ class AlgoPlaygroundController(QObject):
             self.ui.status_label.setText(
                 f"Status: {algo_id} hinzugefuegt "
                 f"(unsichtbar – Checkbox aktivieren)")
-            # Canvas neu rendern, damit die Liste/Overlays aktuell sind.
-            self._render_chart()
+            # Kein Canvas-Neuaufbau noetig: die Instanz ist UNCHECKED und
+            # zeichnet nichts – sichtbar wird sie erst per Checkbox (dann
+            # inkrementell via Plotly.addTraces, Phase 6).
 
     def _on_algo_removed(self, algo_id: str, instance_key: str) -> None:
         """Kontextmenue 'Entfernen': Zustand nachfuehren (RAM-only)."""
+        # Sichtbare Overlay-Traces der Instanz zuerst entfernen (inkrementell,
+        # KEIN Canvas-Neuaufbau).
+        self._remove_overlay_traces(instance_key)
         # Parameter/Overlay/Farbe der entfernten Instanz verwerfen.
         self.instance_params.pop(instance_key, None)
         self._overlays.pop(instance_key, None)
@@ -222,16 +253,24 @@ class AlgoPlaygroundController(QObject):
         self.active_algos = list(self.ui.algo_panel.algo_ids())
         self.ui.status_label.setText(
             f"Status: {algo_id} entfernt (aktiv: {len(self.active_algos)})")
-        # Canvas neu rendern, damit das Overlay verschwindet.
-        self._render_chart()
 
     def _on_visibility_changed(self, algo_id: str, instance_key: str,
                                checked: bool) -> None:
-        """Checkbox geaendert: Overlay ein/ausblenden (KEIN Neuberechnen)."""
+        """Checkbox geaendert: Overlay INKREMENTELL ein/ausblenden.
+
+        USER-REQ (17.08.2026): kein kompletter Canvas-Neuaufbau. An statt
+        setHtml wird nur der/die Overlay-Trace(s) der Instanz per
+        Plotly.addTraces/deleteTraces hinzugefuegt/entfernt – der aktuelle
+        Zoom und alle anderen Traces bleiben unveraendert.
+        """
         state = "ein" if checked else "aus"
         self.ui.status_label.setText(
             f"Status: {algo_id} Darstellung {state}")
-        self._render_chart()
+        if checked:
+            for t in self._build_instance_traces(instance_key):
+                self._add_overlay_trace(t)
+        else:
+            self._remove_overlay_traces(instance_key)
 
     def _on_algo_selected(self, algo_id: str, instance_key: str) -> None:
         """Eintrag angeklickt: Parameter-Form mit Schema + Werten befuellen."""
@@ -291,8 +330,9 @@ class AlgoPlaygroundController(QObject):
             "time_range": [int(from_epoch), int(to_epoch)],
             "splitter_main": [int(x) for x in self.ui.splitter.sizes()],
             "splitter_left": [int(x) for x in self.ui.left_splitter.sizes()],
-            # Phase 6: aktueller Plotly-View (Zoom/Skala) fuer den Neustart.
-            "view": self._capture_view(),
+            # Phase 6: letzter vom View-Timer gelesener Plotly-View
+            # (Zoom/Skala) fuer den Neustart. KEIN JS waehrend closeEvent.
+            "view": self._last_view,
         }
         self.ui.state_manager.save_global_value(PLAYGROUND_STATE_KEY, state)
 
@@ -469,12 +509,12 @@ class AlgoPlaygroundController(QObject):
         """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View.
 
         Args:
-            preserve_view: True (Default) -> der aktuelle Plotly-Zoom/Skala
-                wird VOR dem Re-Render gelesen und danach wieder angewendet,
-                damit Checkbox-/Param-Aenderungen die Ansicht nicht
-                zuruecksetzen. False -> keine Kontinuitaet (z. B. Zeitraum
-                oder Symbol/TF gewechselt); ein via restore_state gesetzter
-                _pending_view wird in jedem Fall angewendet (Phase 6).
+            preserve_view: True (Default) -> der zuletzt bekannte Plotly-
+                Zoom/Skala wird beim Neuaufbau wieder angewendet (eingebettet
+                ins HTML), damit die Ansicht nach Checkbox-/Param-Aenderungen
+                nicht zurueckspringt. False -> keine Kontinuitaet (z. B.
+                Zeitraum oder Symbol/TF gewechselt); ein via restore_state
+                gesetzter _pending_view wird in jedem Fall angewendet.
 
         Die setHtml-BaseUrl zeigt auf das assets/-Verzeichnis, damit die
         lokale plotly.min.js-Datei geladen werden kann (Bugfix 17.08.2026:
@@ -484,11 +524,9 @@ class AlgoPlaygroundController(QObject):
         if canvas is None:
             return  # kein Canvas (z.B. Tests mit FakeView)
 
-        # Phase 6: Zoom-Kontinuitaet – aktuellen View sichern (falls gewuenscht).
-        if preserve_view:
-            current = self._capture_view()
-            if current is not None:
-                self._pending_view = current
+        # Phase 6: Zoom-Kontinuitaet – letzten bekannten View uebernehmen.
+        if preserve_view and self._last_view is not None:
+            self._pending_view = self._last_view
 
         symbol = getattr(self.ui, "current_symbol", lambda: "?")()
         timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
@@ -498,32 +536,54 @@ class AlgoPlaygroundController(QObject):
         if hasattr(self.ui, "algo_panel"):
             checked = self.ui.algo_panel.checked_states()
         overlays = self._build_overlay_traces(checked)
+        # Reihenfolge der sichtbaren Overlay-Traces merken: fuer spaetere
+        # inkrementelle Aenderungen per JS (Trace-Index = 1 + Position).
+        self._overlay_order = [t["key"] for t in overlays]
+
+        # Der gespeicherte View wird direkt ins HTML eingebettet und dort
+        # NACH dem Plotly-Render angewendet – zuverlaessiger als ein
+        # runJavaScript direkt nach setHtml (das liefe auf der alten Seite).
         html = self._chart_service.build_candlestick_html(
             self._candles_cache, from_epoch, to_epoch, symbol, timeframe,
-            overlays=overlays)
+            overlays=overlays, initial_view=self._pending_view)
+        # Phase 6 (Bugfix 17.08.2026): _pending_view nur konsumieren, wenn
+        # das HTML das View-Restore-Skript tatsaechlich eingebettet hat.
+        # Leere Render (keine Kerzen -> _EMPTY_HTML ohne Skript) duerfen den
+        # Restore-View nicht verwerfen – sonst geht der Zoom verloren, wenn
+        # vor dem ersten Daten-Render z. B. ein set_range (range_changed ->
+        # Render auf leerem Cache) feuert. Der View bleibt dann fuer den
+        # naechsten Render MIT Daten erhalten.
+        if VIEW_SCRIPT_MARKER in html:
+            self._pending_view = None
 
         assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "assets")
         canvas.setHtml(html, QUrl.fromLocalFile(
             os.path.normpath(assets_dir).replace("\\", "/") + "/"))
 
-        # Phase 6: gespeicherten/aktuellen View nach dem Render anwenden.
-        # Nur bei vorhandenen Daten (leere Seite hat kein Plotly-Div);
-        # sonst bleibt _pending_view fuer den naechsten Render erhalten.
-        if self._pending_view is not None and self._candles_cache is not None \
-                and not self._candles_cache.empty:
-            self._apply_view(self._pending_view)
-            self._pending_view = None
+        # Nach dem Render den frischen View (Restore-/Standardwerte)
+        # einsammeln – fuer den naechsten preserve-Render bzw. save_state.
+        QTimer.singleShot(500, self._poll_view)
 
     # ------------------------------------------------------------------
-    # Phase 6: Plotly-View (Zoom/Skala) lesen + anwenden
+    # Phase 6: Plotly-View (Zoom/Skala) lesen + Overlays inkrementell
     # ------------------------------------------------------------------
+    def _poll_view(self) -> None:
+        """Timer: liest den aktuellen Plotly-View und cached ihn in _last_view.
+
+        Wird periodisch (2s) und nach jedem Render (singleShot 500ms)
+        ausgefuehrt. save_state nutzt dann nur noch den Cache – kein JS
+        beim Schliessen.
+        """
+        view = self._capture_view()
+        if view is not None:
+            self._last_view = view
+
     def _capture_view(self) -> Optional[dict]:
         """Liest den aktuellen Plotly-View (x/y-Range) synchron aus dem Canvas.
 
-        runJavaScript ist asynchron -> QEventLoop + Timeout (800ms), damit
-        save_state/_render_chart den Wert sofort haben. Ohne Canvas/Page
-        oder ohne gerendertes Plot -> None (Tests, leerer Canvas).
+        runJavaScript ist asynchron -> QEventLoop + Timeout (800ms). Ohne
+        Canvas/Page oder ohne gerendertes Plot -> None (Tests, leerer Canvas).
         """
         canvas = getattr(self.ui, "canvas", None)
         page = getattr(canvas, "page", None)
@@ -555,33 +615,69 @@ class AlgoPlaygroundController(QObject):
             return view
         return None
 
-    def _apply_view(self, view: Optional[dict]) -> None:
-        """Wendet einen gespeicherten Plotly-View nach dem Render an (Phase 6)."""
-        if not view:
-            return
+    # ------------------------------------------------------------------
+    # Phase 6: Inkrementelle Overlay-Aenderungen (USER-REQ, kein Neuaufbau)
+    # ------------------------------------------------------------------
+    def _run_js(self, js: str) -> bool:
+        """Fuehrt JS auf dem aktuellen Canvas aus (True wenn ausgefuehrt)."""
         canvas = getattr(self.ui, "canvas", None)
         page = getattr(canvas, "page", None)
         if page is None or not callable(page):
-            return  # kein echtes QWebEngineView (z. B. Tests)
+            return False  # z. B. CanvasStub in Tests
         try:
             qpage = page()
             if qpage is not None:
-                qpage.runJavaScript(_js_apply_view(view))
+                qpage.runJavaScript(js)
+                return True
         except Exception as exc:
-            print(f"WARN [Playground] View-Anwenden fehlgeschlagen: {exc}")
+            print(f"WARN [Playground] runJavaScript fehlgeschlagen: {exc}")
+        return False
+
+    def _add_overlay_trace(self, trace: dict) -> None:
+        """Fuegt einen Overlay-Trace per Plotly.addTraces hinzu (inkrementell)."""
+        if not self._run_js(_js_add_overlay(trace)):
+            return
+        self._overlay_order.append(trace["key"])
+
+    def _remove_overlay_traces(self, instance_key: str) -> None:
+        """Entfernt alle Overlay-Traces einer Instanz per deleteTraces."""
+        for k in [k for k in self._overlay_order
+                  if k.startswith(instance_key + "::")]:
+            idx = 1 + self._overlay_order.index(k)
+            self._run_js(_js_remove_overlay(idx))
+            self._overlay_order.remove(k)
+
+    def _update_overlay_traces(self, instance_key: str) -> None:
+        """Aktualisiert sichtbare Overlay-Traces einer Instanz (Param-Change).
+
+        Entfernt und fuegt die Traces neu hinzu – die Daten (x/y) haben sich
+        geaendert; der Canvas wird dabei NICHT neu aufgebaut.
+        """
+        self._remove_overlay_traces(instance_key)
+        for t in self._build_instance_traces(instance_key):
+            self._add_overlay_trace(t)
 
     # ------------------------------------------------------------------
     # Phase 5: Overlays (Berechnung, Farben, DB-Persistenz, Debounce)
     # ------------------------------------------------------------------
     def _on_debounce_timeout(self) -> None:
-        """Debounce abgelaufen: betroffene Instanz neu berechnen + rendern."""
+        """Debounce abgelaufen: betroffene Instanz im RAM neu berechnen.
+
+        Sichtbare Overlays werden INKREMENTELL per JS aktualisiert (kein
+        Canvas-Neuaufbau) – der Zoom und die anderen Traces bleiben erhalten.
+        """
         if self._pending_recalc is None:
             return
         key = self._pending_recalc
         self._pending_recalc = None
         self._recalc_overlay(key)
+        # Sichtbar? -> Traces der Instanz aktualisieren (nur RAM-Daten).
+        checked: Dict[str, bool] = {}
+        if hasattr(self.ui, "algo_panel"):
+            checked = self.ui.algo_panel.checked_states()
+        if checked.get(key, True) is not False:
+            self._update_overlay_traces(key)
         self.ui.status_label.setText("Status: Parameter angewendet")
-        self._render_chart()
 
     def _recalc_all_overlays(self) -> None:
         """Berechnet alle Instanz-Overlays neu (Datenkontext geaendert)."""
@@ -638,45 +734,55 @@ class AlgoPlaygroundController(QObject):
             self._overlay_colors[instance_key] = OVERLAY_COLORS[idx]
         return self._overlay_colors[instance_key]
 
-    def _build_overlay_traces(self, checked: Dict[str, bool]) -> List[dict]:
-        """Baut die sichtbaren Overlay-Traces fuer den Canvas (Zeitraum-Slice).
+    def _build_instance_traces(self, instance_key: str) -> List[dict]:
+        """Baut die Overlay-Trace-Dicts EINER Instanz (Zeitraum-Slice).
 
-        Nur Instanzen mit aktivierter Checkbox. Die Serien werden auf den
-        sichtbaren Zeitraum geschnitten, damit sie die X-Achse nicht ueber
-        den Candlestick-Bereich hinaus dehnen (Konzept 2.4: Slicen statt
-        Neuladen). Rueckgabe-Format passt zum `overlays`-Parameter des
-        PlaygroundChartService.
+        Pro Ergebnis-Feld der Instanz ein Trace mit eindeutigem "key"
+        ("instance_key::name") – wird fuer den initialen HTML-Render und die
+        inkrementellen JS-Aenderungen (add/remove/update) verwendet.
         """
-        if not self._overlays:
-            return []
-        from_epoch, to_epoch = self.ui.time_range.get_range()
         panel = self.ui.algo_panel
         keys = panel.instance_keys()
-        ids = panel.algo_ids()
+        if instance_key not in keys:
+            return []
+        idx = keys.index(instance_key)
+        algo_id = panel.algo_ids()[idx] if idx < len(keys) else "?"
+        overlays = self._overlays.get(instance_key)
+        if not overlays:
+            return []
+        color = self._color_for_instance(instance_key)
+        from_epoch, to_epoch = self.ui.time_range.get_range()
         traces: List[dict] = []
-        for key in keys:
+        for name, series in overlays.items():
+            if series is None or len(series) == 0:
+                continue
+            # Zeitraum-Slice (Konzept 2.4: Slicen statt Neuladen).
+            mask = (series.index >= int(from_epoch)) & \
+                   (series.index <= int(to_epoch))
+            s = series.loc[mask]
+            if s.empty:
+                continue
+            traces.append({
+                "key": f"{instance_key}::{name}",
+                "name": f"{algo_id} ({name})",
+                "x": s.index.tolist(),   # Epoch-Ints (HTML/JS-Konvertierung)
+                "y": s.tolist(),
+                "color": color,
+            })
+        return traces
+
+    def _build_overlay_traces(self, checked: Dict[str, bool]) -> List[dict]:
+        """Baut die sichtbaren Overlay-Traces ALLER Instanzen (fuer HTML).
+
+        Nur Instanzen mit aktivierter Checkbox (Zeitraum-Slice). Das Format
+        passt zum `overlays`-Parameter des PlaygroundChartService; der
+        "key" wird zusaetzlich fuer die Overlay-Reihenfolge genutzt.
+        """
+        traces: List[dict] = []
+        for key in self.ui.algo_panel.instance_keys():
             if checked.get(key, True) is False:
                 continue  # Checkbox aus -> Overlay unsichtbar
-            overlays = self._overlays.get(key)
-            if not overlays:
-                continue
-            idx = keys.index(key)
-            algo_id = ids[idx] if idx < len(ids) else "?"
-            color = self._color_for_instance(key)
-            for name, series in overlays.items():
-                if series is None or len(series) == 0:
-                    continue
-                mask = (series.index >= int(from_epoch)) & \
-                       (series.index <= int(to_epoch))
-                s = series.loc[mask]
-                if s.empty:
-                    continue
-                traces.append({
-                    "name": f"{algo_id} ({name})",
-                    "x": s.index.tolist(),
-                    "y": s.tolist(),
-                    "color": color,
-                })
+            traces.extend(self._build_instance_traces(key))
         return traces
 
     # ------------------------------------------------------------------
