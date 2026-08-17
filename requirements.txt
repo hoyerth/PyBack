@@ -1,0 +1,7 @@
+duckdb
+numpy
+Pandas
+pip
+pytz
+metatrader5
+PySide6
