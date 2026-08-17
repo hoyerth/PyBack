@@ -17,6 +17,10 @@ eine einfache Liste, Klick uebernimmt den Algo als UNCHECKED Instanz.
 Phase 6-Ergaenzung: der aktuelle Plotly-View (Zoom/Skala, x/y-Range) wird
 mit dem Fensterzustand gespeichert und beim Neustart wieder angewendet;
 bei Checkbox-/Param-Aenderungen bleibt der Zoom erhalten (Kontinuitaet).
+Phase 6.1: Overlay-Berechnungen (get_overlay_series) laufen in einem
+PlaygroundWorker (QThread), damit das UI nicht einfriert. Ergebnisse
+kommen asynchron per Signal zurueck; eine Generationsnummer pro Instanz
+verwirft veraltete Ergebnisse (z. B. bei schnellen Param-Aenderungen).
 
 Verantwortlich (SRP/IoC):
   * Registry einmalig laden (AlgoRegistry.discover_algos)
@@ -47,6 +51,7 @@ from ui.playground_chart_service import (
     VIEW_SCRIPT_MARKER,
     PlaygroundChartService,
 )
+from workers.playground_worker import PlaygroundWorker
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
@@ -170,6 +175,13 @@ class AlgoPlaygroundController(QObject):
         self._debounce.setInterval(300)
         self._debounce.timeout.connect(self._on_debounce_timeout)
         self._pending_recalc: Optional[str] = None  # instance_key oder "all"
+
+        # Phase 6.1: Overlay-Berechnung im Hintergrund (QThread). Pro Instanz
+        # eine Generationsnummer – veraltete Worker-Ergebnisse (schnelle
+        # Param-/Daten-Aenderungen) werden beim Eintreffen verworfen.
+        self._overlay_generation: Dict[str, int] = {}
+        # Referenzen auf laufende PlaygroundWorker (GC-Schutz + Aufraeumen).
+        self._workers: List[PlaygroundWorker] = []
 
         self._init_bindings()
 
@@ -661,35 +673,43 @@ class AlgoPlaygroundController(QObject):
     # Phase 5: Overlays (Berechnung, Farben, DB-Persistenz, Debounce)
     # ------------------------------------------------------------------
     def _on_debounce_timeout(self) -> None:
-        """Debounce abgelaufen: betroffene Instanz im RAM neu berechnen.
+        """Debounce abgelaufen: betroffene Instanz neu berechnen (async).
 
-        Sichtbare Overlays werden INKREMENTELL per JS aktualisiert (kein
-        Canvas-Neuaufbau) – der Zoom und die anderen Traces bleiben erhalten.
+        Phase 6.1: Die Berechnung startet einen PlaygroundWorker (QThread)
+        statt im UI-Thread zu rechnen. Sobald das Ergebnis eintrifft
+        (_on_overlay_computed), werden sichtbare Overlays INKREMENTELL per
+        JS aktualisiert (kein Canvas-Neuaufbau) – der Zoom und die anderen
+        Traces bleiben erhalten.
         """
         if self._pending_recalc is None:
             return
         key = self._pending_recalc
         self._pending_recalc = None
         self._recalc_overlay(key)
-        # Sichtbar? -> Traces der Instanz aktualisieren (nur RAM-Daten).
-        checked: Dict[str, bool] = {}
-        if hasattr(self.ui, "algo_panel"):
-            checked = self.ui.algo_panel.checked_states()
-        if checked.get(key, True) is not False:
-            self._update_overlay_traces(key)
-        self.ui.status_label.setText("Status: Parameter angewendet")
+        self.ui.status_label.setText(
+            "Status: Parameter wird neu berechnet ...")
 
     def _recalc_all_overlays(self) -> None:
-        """Berechnet alle Instanz-Overlays neu (Datenkontext geaendert)."""
+        """Berechnet alle Instanz-Overlays neu (Datenkontext geaendert).
+
+        Phase 6.1: asynchron ueber PlaygroundWorker. Die bisherigen Overlays
+        gehoeren zum alten Datenkontext (alte Kerzen) und werden verworfen;
+        die frischen Ergebnisse kommen per Signal in _on_overlay_computed
+        zurueck und werden dort sichtbar gemacht.
+        """
+        self._overlays.clear()
         for key in list(self.ui.algo_panel.instance_keys()):
             self._recalc_overlay(key)
 
     def _recalc_overlay(self, instance_key: str) -> None:
-        """Berechnet die Overlay-Serien EINER Instanz im RAM (vektorisiert).
+        """Startet die Overlay-Berechnung EINER Instanz im Hintergrund.
 
-        Holt algo_id + Parameter, instanziiert den Algo und ruft
-        `get_overlay_series(self._candles_cache)` auf. Ergebnis wird
-        gehalten in self._overlays[instance_key].
+        Phase 6.1: Die Berechnung (get_overlay_series) laeuft in einem
+        PlaygroundWorker (QThread) statt im UI-Thread. Das Ergebnis kommt
+        asynchron via Signal zurueck (_on_overlay_computed) und wird dort
+        gespeichert und ggf. per JS sichtbar gemacht. Eine Generationsnummer
+        pro Instanz verwirft veraltete Ergebnisse (z. B. bei schnellen
+        Parameter-Aenderungen oder Daten-Neuladen).
 
         USER-REQ (17.08.2026): NUR RAM-Berechnung + Plot – KEINE DB-
         Persistenz (AlgoResultsRepository folgt in einer spaeteren Phase).
@@ -705,27 +725,63 @@ class AlgoPlaygroundController(QObject):
             self._overlays.pop(instance_key, None)
             return
 
-        try:
-            algo = entry["class"](
-                **(self.instance_params.get(instance_key) or {}))
-        except Exception as exc:
-            print(f"WARN [Playground] Instanzierung {algo_id}: {exc}")
-            self._overlays.pop(instance_key, None)
-            return
-
         if self._candles_cache is None or self._candles_cache.empty:
             self._overlays[instance_key] = {}
             return
 
-        try:
-            series_dict = algo.get_overlay_series(self._candles_cache)
-        except Exception as exc:
-            print(f"WARN [Playground] Overlay {algo_id}: {exc}")
-            self._overlays[instance_key] = {}
-            return
+        # Generationsnummer erhoehen -> aeltere Ergebnisse werden verworfen.
+        generation = self._overlay_generation.get(instance_key, 0) + 1
+        self._overlay_generation[instance_key] = generation
 
-        self._overlays[instance_key] = (
-            dict(series_dict) if isinstance(series_dict, dict) else {})
+        worker = PlaygroundWorker(
+            entry["class"],
+            instance_key,
+            self.instance_params.get(instance_key) or {},
+            self._candles_cache,
+            generation=generation,
+            parent=self,
+        )
+        worker.overlay_computed.connect(self._on_overlay_computed)
+        worker.overlay_failed.connect(self._on_overlay_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._workers.append(worker)
+        worker.start()
+
+    def _on_overlay_computed(self, generation: int, instance_key: str,
+                             series: dict) -> None:
+        """Ergebnis eines PlaygroundWorkers: speichern + sichtbar machen.
+
+        Wirft veraltete Ergebnisse ab (Generationsnummer ungleich aktueller
+        Auftrag oder Instanz inzwischen entfernt). Sichtbare Overlays werden
+        INKREMENTELL per JS aktualisiert (kein Canvas-Neuaufbau).
+        """
+        if self._overlay_generation.get(instance_key) != generation:
+            return  # veraltet (Param/Instanz inzwischen geaendert)
+        if instance_key not in self.ui.algo_panel.instance_keys():
+            return  # Instanz wurde inzwischen entfernt
+        self._overlays[instance_key] = dict(series)
+        # Sichtbar? -> Traces der Instanz per JS aktualisieren (nur RAM).
+        checked: Dict[str, bool] = {}
+        if hasattr(self.ui, "algo_panel"):
+            checked = self.ui.algo_panel.checked_states()
+        if checked.get(instance_key, True) is not False:
+            self._update_overlay_traces(instance_key)
+            self.ui.status_label.setText("Status: Parameter angewendet")
+
+    def _on_overlay_failed(self, generation: int, instance_key: str,
+                           error: str) -> None:
+        """Fehler eines PlaygroundWorkers: protokollieren + RAM loeschen."""
+        print(f"WARN [Playground] Overlay {instance_key}: {error}")
+        if self._overlay_generation.get(instance_key) == generation:
+            self._overlays.pop(instance_key, None)
+
+    def _on_worker_finished(self) -> None:
+        """QThread beendet: Worker-Referenz aufraeumen (GC-Schutz)."""
+        worker = self.sender()
+        if worker is not None and worker in self._workers:
+            self._workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
 
     def _color_for_instance(self, instance_key: str) -> str:
         """Weist einer Instanz eine stabile Overlay-Farbe zu (Farbzyklus)."""
