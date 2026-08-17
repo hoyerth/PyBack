@@ -23,7 +23,7 @@ Nutzt die uebernommenen Bausteine:
 import sys
 from typing import List
 
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,15 +34,18 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from config.event_bus import event_bus
+from controllers.algo_playground_controller import AlgoPlaygroundController
 from data_sync.mt5_sync_service import TF_SECONDS_MAP
 from persistent_win import PersistentWindow
 from repositories.symbol_repository import SymbolRepository, get_symbol_repository
 from state_manager import StateManager
+from ui.algo_list_panel import AlgoListPanel
 from ui.time_range_widget import TimeRangeWidget
 from ui.window_manager import WindowManager
 from workers.data_sync_worker import DataSyncWorker
@@ -103,6 +106,9 @@ class MainWin(QMainWindow):
 
         self._stdout_redirect = _QtStdout(self.log)
         self._orig_stdout = sys.stdout
+
+        # Playground-Controller (haelt die Logik aus main_win heraus).
+        self.playground_controller = AlgoPlaygroundController(self)
 
         # Favoriten-Aenderungen (SymbolsWindow) refreshen die Symbol-Combo.
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
@@ -173,12 +179,34 @@ class MainWin(QMainWindow):
         # -- Zeitraum-Zeile (Playground, Phase 1) --------------------------
         self.time_range = TimeRangeWidget()
 
-        # -- Canvas-Bereich (Platzhalter, Phase 4: QWebEngineView) ---------
-        # Nimmt den gesamten verbleibenden Platz zwischen Zeitraum-Zeile und
-        # Statuszeile ein (dehnbarer Frame).
+        # -- Linkes Panel: Algo-Liste (Phase 2) + Parameter-Platzhalter ----
+        self.algo_panel = AlgoListPanel()
+
+        self.param_placeholder = QLabel("Parameter:\n(Phase 3)")
+        self.param_placeholder.setFrameShape(QFrame.StyledPanel)
+        self.param_placeholder.setMinimumHeight(90)
+        self.param_placeholder.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("Algo-Liste:"))
+        left_layout.addWidget(self.algo_panel, 1)
+        left_layout.addWidget(self.param_placeholder)
+        left_panel.setLayout(left_layout)
+
+        # -- Rechter Bereich: Canvas-Platzhalter (Phase 4: QWebEngineView) --
         self.canvas_placeholder = QFrame()
         self.canvas_placeholder.setFrameShape(QFrame.StyledPanel)
         self.canvas_placeholder.setMinimumHeight(200)
+
+        # -- Splitter (verschiebbar, Anwender-Entscheidung 1) --------------
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(left_panel)
+        self.splitter.addWidget(self.canvas_placeholder)
+        self.splitter.setSizes([280, 820])  # Initiale Groessen
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
 
         # -- Log-Feld (ganz unten, nur 5 Zeilen hoch) ----------------------
         self.log = QPlainTextEdit()
@@ -191,7 +219,7 @@ class MainWin(QMainWindow):
         layout = QVBoxLayout()
         layout.addLayout(top_row)
         layout.addWidget(self.time_range)
-        layout.addWidget(self.canvas_placeholder, 1)  # dehnt sich aus
+        layout.addWidget(self.splitter, 1)  # dehnt sich aus
         layout.addWidget(self.status_label)
         layout.addWidget(self.log)
 
