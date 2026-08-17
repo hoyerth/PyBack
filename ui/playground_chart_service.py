@@ -34,10 +34,24 @@ _PLOTLY_JS_ABS = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), _PLOTLY_JS_REL))
 _PLOTLY_JS_URL = _PLOTLY_JS_ABS.replace("\\", "/")
 
+# Plotly-Config fuer TradingView/MT5-aehnliches Verhalten im Canvas
+# (Anwender-Anforderung, 17.08.2026):
+#   * scrollZoom=True      - Mausrad zoomt direkt an der Cursor-Position
+#   * displayModeBar=True  - Toolbar anzeigen (Zoom/Pan/SaveImage)
+#   * modeBarButtonsToRemove - lasso2d/select2d (unnoetige Auswahl-Tools)
+#   * dragmode='pan'       - normaler Klick-und-Drag VERSCHIEBT den Chart
+#     (statt Auswahlrechteck), wie bei TradingView/MT5
+_PLOTLY_CONFIG = {
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+    "responsive": True,
+    "displaylogo": False,
+}
+
 # Dunkler Body-Hintergrund passend zum plotly_dark-Template (#111418 ist die
 # plotly_dark-Paper-Farbe, damit der Canvas nahtlos dunkel wirkt).
 _BODY_STYLE = "margin:0;padding:0;background:#111418;overflow:hidden"
-
 _EMPTY_HTML = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground</title></head>
@@ -119,6 +133,9 @@ class PlaygroundChartService:
             autosize=True,
             hovermode="x unified",
             legend=dict(orientation="h", y=1.02),
+            # Normaler Klick-und-Drag verschiebt den Chart (TradingView-Stil),
+            # statt ein Auswahlrechteck zu ziehen.
+            dragmode="pan",
         )
 
         # Luecken ausblenden (Wochenende/Pausen/kurze Tage -> wie TradingView).
@@ -129,8 +146,7 @@ class PlaygroundChartService:
                 fig.update_xaxes(rangebreaks=breaks)
 
         plot_div = fig.to_html(
-            full_html=False, include_plotlyjs=False,
-            config={"displaylogo": False})
+            full_html=False, include_plotlyjs=False, config=_PLOTLY_CONFIG)
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title></head>
