@@ -192,29 +192,37 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 
 ---
 
-## Angefordert (geplant, NICHT umgesetzt): MA-Algo aus PyTrader (17.08.2026, 18:16)
+## Implementierungs-Log: MA-Algo aus PyTrader (17.08.2026, 18:26)
 
-> **USER-REQ (Zielbild, Implementierung wartet auf ausdruecklichen Startschuss):** MA-Indikator aus PyTrader pruefen und als Algo einbauen – **EIN MA-Wert** (nicht 8 wie PyTrader `ind_moving_averages`). Nachfolgend die finalen Vorgaben des Anwenders.
+> **USER-REQ (final, 17.08.2026):** MA-Indikator aus PyTrader pruefen und als Algo einbauen – **EIN MA-Wert** statt 8 (`ind_moving_averages`). Vorgaben: Defaults wie PyTrader (`EHMA/4/smoothing 10/alpha 2.0`), Preisquelle **nur close** (kein `use_close`), zusaetzlich **dual_color** (Checkbox "Auf/Ab verschiedene Farben") mit zwei Farbfeldern **Vorgabe Gruen/Rot**.
 
-### Anforderung (final, 17.08.2026)
+### Entscheidungen
 
-1. **Defaults wie PyTrader:** `ma_type=EHMA`, `period=4`, `smoothing=10`, `alpha_factor=2.0`.
-2. **Preisquelle:** nur `close` (KEIN `use_close`-Schalter / kein H+L+C/3).
-3. **Zusaetzlich uebernehmen (dual_color-Semantik aus PyTrader MA1):**
-   a. Checkbox **aufsteigend/absteigend verschiedene Farben** (`dual_color`): MA t >= t-1 -> bull-Farbe, sonst bear-Farbe.
-   b. Die beiden Farbfelder mit **Vorgabe Gruen/Rot** (bull_color default gruen, bear_color default rot).
-4. Sonst: `parameter_schema` als PineScript-Input-Zone am Dateianfang; `result_schema = {"ma": {"type": "float", "store": "series"}}`; `get_overlay_series(candles_df) -> dict` mit Index = `candles_df["time"]` (Epoch-Int, Wanduhr); StylePicker-Keys `line_color`/`line_style`/`line_width` (PyBack-Plotly-Dash-Werte, NICHT PyTrader-LWC-Werte).
+* **Uebernahme:** Kern (`MATemplateEngine.calculate_ma`, 12 MA-Typen, vektorisiert) als `algos/ma_utils.py` copy-adaptiert. LWC-spezifische Teile (`build_chart_payload`) entfallen; `build_color_series` wird fuer die dual_color-Semantik genutzt.
+* **Farben:** `_DEFAULT_BULL_COLOR="#089981"` (Gruen), `_DEFAULT_BEAR_COLOR="#F23645"` (Rot) – TradingView-Standardfarben, identisch mit dem Projekt-Palette (`_PALETTE_COLORS`).
+* **dual_color-Render (offener Punkt aus der Anforderung geloest):** PyBack rendert Overlays als EIN Trace mit EINER Farbe. Da Plotly in EINEM Linien-Trace keine wechselnden Farben darstellt, wurde der Overlay-Vertrag additiv erweitert:
+  * `get_overlay_series` darf pro Feld ein **Tupel `(pd.Series, Farbliste je Punkt)`** liefern (statt reiner pd.Series).
+  * Der Controller (`_build_segment_traces`) splittet die Serie **je eindeutiger Farbe** in einen Trace mit NaN-Luecken an Farbwechseln (`connectgaps=False` -> sichtbare Brueche). Zeitraum-Slice + LOD wie beim Einzel-Trace (vektorisiert).
+  * Der Chart-Service honoriert `connectgaps` aus dem Trace-Dict (Default True fuer den bisherigen SMA-Pfad, False fuer Segment-Traces).
+* **`algo_param`-Flag:** bull_color/bear_color sind `type=color` (StylePicker-Farbfelder), tragen aber das neue Schema-Flag `algo_param: True` → `collect_style_keys` filtert sie NICHT aus den Algo-Parameters (sie steuern die Segment-Farben der Algo-Klasse). `line_color`/`line_style`/`line_width` bleiben reine Darstellungs-Keys.
 
-### Bausteine (Quelle, bewertet)
+### Aenderungen
 
-* `F:\Python\PyTrader\chart\indicators\utils\ma_template.py` – `MATemplateEngine.calculate_ma` (12 MA-Typen, vektorisiert) wirtschaftlich uebernehmbar; **ohne** `build_chart_payload` (LWC-spezifisch). `build_color_series`/`resolve_bull_color` werden fuer die dual_color-Semantik benoetigt (Farbe je Punkt).
-* `candles_df` enthaelt `tick_volume` (Repository, NaN->0) → VWMA funktioniert ohne DB-Aenderung.
+| Datei | Inhalt |
+|-------|--------|
+| `algos/ma_utils.py` | **Neu:** Vektorisierte MA-Utility (aus PyTrader `ma_template.py` adaptiert): 12 MA-Typen, Guards (kurze Serien/Warmup/VWMA-Fallback), `calculate_ma` (mit smoothing = zweiter EMA-Pass), `build_color_series` (dual_color). |
+| `algos/alg_ma.py` | **Neu:** AlgoPlugin mit Definitions-Zone (`parameter_schema` als PineScript-Input-Zone, `result_schema = {"ma": {store: series}}`), Defaults EHMA/4/10/2.0, nur close, dual_color-Checkbox + bull/bear-Farbfelder (Gruen/Rot). `get_overlay_series` liefert `{"ma": pd.Series}` bzw. `{"ma": (Serie, Farben)}` bei dual_color. |
+| `ui/style_models.py` | `collect_style_keys`: Keys mit Flag `algo_param` werden NICHT als Darstellungs-Keys gesammelt (bleiben Algo-Parameter). |
+| `controllers/algo_playground_controller.py` | `_build_instance_traces` verarbeitet Tupel-Werte (Serie, Farben) → neue Methode `_build_segment_traces` (Segment-Traces je Farbe, connectgaps=False, Zeitraum-Slice + LOD). |
+| `ui/playground_chart_service.py` | `build_chart_figure`: `connectgaps` wird aus dem Trace-Dict gelesen (Default True – SMA-Pfad unveraendert; Segment-Traces setzen False). |
+| `test/check_alg_ma.py` | **Neu (lokal, gitignored):** Registry, Overlay-Serie, **Parity alle 12 MA-Typen gegen PyTrader-Referenz** (max diff < 1e-9), VWMA-Fallback, dual_color-Tupel, collect_style_keys, ParamFormWidget, Controller-Segment-Traces. |
 
-### Offen (vor/nach Freigabe)
+### Verifikation (headless, keine UI)
 
-* **Render der dual_color-Linie in PyBack (Plotly):** PyBack rendert Overlays als EIN durchgehender Trace (eine Farbe via `_style_for_instance`). Fuer bull/bear-Segmente ist ein Segment-Ansatz (mehrere Traces je Farbblock oder Marker-Farbe je Punkt) noetig – Detail-Entscheidung bei der Umsetzung.
+* `test/check_alg_ma.py` – **alle 8 Checks OK** (inkl. Parity gegen `F:\Python\PyTrader\chart\indicators\utils\ma_template.py`).
+* `test/test.py` – komplette Suite **alle Phasen 0–7 OK** (keine Regression).
+* `py_compile` auf allen geaenderten/neuen Dateien OK.
 
-### Status
+### Bedienung
 
-* Keine Dateien angelegt (`algos/alg_ma.py`, `algos/ma_utils.py` existieren nicht). Kein Commit fuer Punkt 2.
-* **Wartet auf ausdruecklichen Anwender-Befehl ("nicht coden, warte auf meinen befehl").**
+* Algo "MA" im Playground: MA-Typ (12 Optionen), Periode, Glaettung, Decay-Faktor; Checkbox "Auf/Ab verschiedene Farben" + Farbfelder Gruen/Rot fuer aufsteigend/absteigend. Ohne dual_color gilt der Stil-Picker (Farbe/Linienart/Staerke).

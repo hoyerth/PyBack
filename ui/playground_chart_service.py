@@ -265,7 +265,10 @@ class PlaygroundChartService:
                     # verhindert sichtbare Luecken/Brueche bei NaN-Warmup
                     # (erste period-1 Kerzen) und internen NaN-Gaps – die
                     # Linie bleibt durchgehend im sichtbaren Bereich.
-                    connectgaps=True,
+                    # USER-REQ (17.08.2026, alg_ma dual_color):
+                    # Segment-Traces setzen connectgaps=False (Farbwechsel
+                    # als sichtbare Brueche) – Default bleibt True.
+                    connectgaps=bool(ov.get("connectgaps", True)),
                 )
             if "markers" in mode:
                 trace["marker"] = dict(

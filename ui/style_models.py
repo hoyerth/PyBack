@@ -74,9 +74,16 @@ def collect_style_keys(schema: Optional[Dict[str, Any]]) -> set:
     (style/width bzw. symbol/size). Diese Keys werden NICHT als Fach-
     Parameter an die Algo-Klasse gereicht (PlaygroundWorker) und nicht in
     die Overlay-Berechnung einbezogen – sie steuern nur das Zeichnen.
+
+    USER-REQ (17.08.2026, alg_ma dual_color): Keys mit dem Schema-Flag
+    ``algo_param`` sind FACH-Parameter des AlgOS (z. B. bull_color/
+    bear_color fuer die Segment-Farben) und werden an die Algo-Klasse
+    gereicht – sie werden hier NICHT gesammelt.
     """
     keys: set = set()
     for name, spec in (schema or {}).items():
+        if spec.get("algo_param"):
+            continue
         if str(spec.get("type", "")).lower() == "color":
             keys.add(name)
             if not spec.get("color_only"):

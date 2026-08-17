@@ -1231,6 +1231,9 @@ class AlgoPlaygroundController(QObject):
         Overlays stecken im Figure-Dict, kein fragiles addTraces-JS).
         Phase 7: Farbe/Linienart/Staerke/Symbol kommen aus den Stil-Params
         der Instanz; der Render-Modus aus dem result_schema.
+        USER-REQ (17.08.2026, alg_ma dual_color): Ein Overlay-Wert kann ein
+        Tupel (pd.Series, Farbliste je Punkt) sein – wird in Segment-Traces
+        je Farbblock gesplittet (_build_segment_traces).
         """
         panel = self.ui.algo_panel
         keys = panel.instance_keys()
@@ -1244,9 +1247,17 @@ class AlgoPlaygroundController(QObject):
         style = self._style_for_instance(instance_key)
         from_epoch, to_epoch = self.ui.time_range.get_range()
         traces: List[dict] = []
-        for name, series in overlays.items():
-            if series is None or len(series) == 0:
+        for name, value in overlays.items():
+            if value is None or len(value) == 0:
                 continue
+            # dual_color: Tupel (Serie, Pro-Punkt-Farben) -> Segment-Traces.
+            if (isinstance(value, tuple) and len(value) == 2 and
+                    isinstance(value[1], (list, tuple))):
+                traces.extend(self._build_segment_traces(
+                    instance_key, name, value[0], list(value[1]),
+                    algo_id, style, from_epoch, to_epoch))
+                continue
+            series = value
             # Zeitraum-Slice (Konzept 2.4: Slicen statt Neuladen).
             mask = (series.index >= int(from_epoch)) & \
                    (series.index <= int(to_epoch))
@@ -1276,6 +1287,79 @@ class AlgoPlaygroundController(QObject):
                 trace["symbol"] = style["symbol"]
             if "size" in style:
                 trace["size"] = style["size"]
+            traces.append(trace)
+        return traces
+
+    def _build_segment_traces(
+        self, instance_key: str, name: str, series: pd.Series,
+        colors: list, algo_id: str, style: Dict[str, Any],
+        from_epoch: int, to_epoch: int,
+    ) -> List[dict]:
+        """Baut je Farbwert EINEN Trace mit NaN-Luecken zwischen Farbbloecken.
+
+        USER-REQ (17.08.2026, alg_ma dual_color): Die MA-Serie traegt eine
+        Pro-Punkt-Farbe (bull/bear). Plotly kann in EINEM Linien-Trace keine
+        wechselnden Farben darstellen – daher wird die Serie je eindeutiger
+        Farbe dupliziert und an andersfarbigen Abschnitten auf NaN gesetzt
+        (connectgaps=False -> sichtbare Brueche statt Verbindung). Zeitraum-
+        Slice + LOD wie beim Einzel-Trace (vektorisiert, keine Loops).
+
+        Args:
+            instance_key: Instanz-Key (fuer den Trace-"key").
+            name: Ergebnis-Feld-Name (z. B. "ma").
+            series: MA-Serie (Index = Epoch-Ints, Wanduhr).
+            colors: Farbe je Punkt (gleiche Laenge wie series).
+            algo_id: Registry-ID (fuer den Trace-"name").
+            style: Stil-Dict aus _style_for_instance (dash/width).
+            from_epoch, to_epoch: Zeitraum-Slice-Grenzen.
+        """
+        traces: List[dict] = []
+        if series is None or len(series) == 0:
+            return traces
+        colors_list = list(colors)
+        n = len(series)
+        if len(colors_list) != n:
+            # Defensiv angleichen (trimmen bzw. mit letzter Farbe auffuellen).
+            if len(colors_list) > n:
+                colors_list = colors_list[:n]
+            elif colors_list:
+                last = colors_list[-1]
+                colors_list = colors_list + [last] * (n - len(colors_list))
+            else:
+                colors_list = ["#ff7f0e"] * n
+        values = pd.to_numeric(series, errors="coerce")
+        valid = ~values.isna()
+        # Eindeutige Farben in Reihenfolge des ersten Auftretens (bei
+        # bull/bear maximal 2, defensiv beliebig viele).
+        unique: List[str] = []
+        for c in colors_list:
+            if c not in unique:
+                unique.append(str(c))
+        for color in unique:
+            mask = (np.asarray(colors_list) == color) & np.asarray(valid)
+            seg = values.where(pd.Series(mask, index=values.index))
+            # Zeitraum-Slice
+            seg = seg.loc[(seg.index >= int(from_epoch)) &
+                          (seg.index <= int(to_epoch))]
+            if seg.empty:
+                continue
+            if len(seg) > self.LOD_MAX_OVERLAY_POINTS:
+                seg = self._decimate_series(seg, self.LOD_MAX_OVERLAY_POINTS)
+            trace: Dict[str, Any] = {
+                "key": f"{instance_key}::{name}::{color}",
+                "name": f"{algo_id} ({name})",
+                "x": seg.index.tolist(),   # Epoch-Ints
+                "y": seg.tolist(),
+                "color": color,
+                "render": "line",
+                # connectgaps=False: NaNs (Farbwechsel) als sichtbare Brueche
+                # (der Einzel-Trace nutzt connectgaps=True, Bugfix SMA).
+                "connectgaps": False,
+            }
+            if "dash" in style:
+                trace["dash"] = style["dash"]
+            if "width" in style:
+                trace["width"] = style["width"]
             traces.append(trace)
         return traces
 
