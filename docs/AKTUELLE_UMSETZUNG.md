@@ -19,131 +19,90 @@
 
 ---
 
-## 2. Konzept: Algo-Playground im Hauptfenster
+## 2. Konzept: Algo-Darstellungs-Picker (Farbe, Linienart, Stärke, Symbol)
 
-### 2.1 Grundsatzentscheidung: Zwei getrennte Welten
+> **Anwender-Anforderung (17.08.2026):** Für **jeden Algo** einen **Color Picker** plus **Auswahl der Linienart**, der **Linienstärke** und – falls der Algo **nicht als Linie** definiert ist – ein **Symbol**. Die Werte werden **gespeichert/restored**; der **Default** liegt in der **Algo-Definition** (`parameter_schema`). **Alles in einem Widget.**
 
-| | **Playground** (in `main_win`) | **Backtest-Fenster** (separat, später) |
+### 2.1 Entscheidung: Übernahme aus PyTrader (wirtschaftlich)
+
+Im Projekt `F:\Python\PyTrader` existiert bereits ein **ausgereifter, generischer Stil-Wähler** (Phase 16, 06.–07.08.2026) – **Kopieren ist wirtschaftlicher als Neuentwicklung:**
+
+| Datei (PyTrader) | Inhalt | Passung |
 |---|---|---|
-| Zweck | Algos **spielerisch** auf Kerzen testen (Overlays) | Echtes **vbt.Portfolio-Backtesting** |
-| Ergebnis | Overlays (Linien, Bänder, Marker) direkt auf dem Kurschart | vbt.Portfolio: Equity, Drawdown, Trades, Kennzahlen |
-| Algo-Vertrag | Overlay-Hook (liefert Serien/Traces) | `compute_signals()` → `vbt.Portfolio` (bestehender Agents.md-Vertrag) |
-| Massentests | – | Parameter-Sweeps, Serien-Runs (eigenes Fenster) |
+| `chart/widgets/style_picker_widget.py` | `StylePickerWidget` (kompakter Button: Farb-Swatch-Icon + Vorschau-Text, z. B. `● 2px Solid`) + `StylePickerDialog` (modaler Popover: TradingView-Farbpalette, Hex/RGB-Eingabe, Transparenz-Slider 0–100 %, `[Anpassen...]`-Fallback auf `QColorDialog.getColor()`, Linienstärke 1–10 px + Linienart-Dropdown, bzw. Markergröße 1–20 px + Markerform-Dropdown, optionale `sichtbar`-Checkbox) | **1:1 passend** |
+| `chart/overlays/style_models.py` | `LineStyle`/`MarkerStyle` Dataclasses + `LINE_STYLES`/`MARKER_SHAPES` + `to_js_dict()`/`to_dict()`/`from_dict()` | **Passend**, aber LWC-v5-Werte → auf Plotly umzustellen |
 
-Ein Algo kann **beide** APIs optional anbieten. Der Playground nutzt nur den Overlay-Teil, das Backtest-Fenster nur den Portfolio-Teil – kein API-Konflikt.
+Beide Dateien sind eigenständig (nur PySide6 + Standardbibliothek). Das Widget erfüllt bereits: Farbe, Linienart, Stärke, Markerform, Persistenz-Verträge (`to_dict`/`from_dict`), `style_changed`-Signal, `get_style()`/`set_style()`/`set_color()`-Fassade.
 
-### 2.2 UI-Gestaltung (verbindlich, UI-Reviews durch Anwender)
+**Notwendige Anpassungen an Plotly (statt TradingView LWC v5):**
+- `LINE_STYLES`: LWC `solid/dashed/dotted/dashdotted` → **Plotly-Dash-Werte** `solid/dot/dash/longdash/dashdot/longdashdot` (exakt die 6 Werte aus dem Plotly-Validator `scatter.line.dash`).
+- `MARKER_SHAPES` → **`PLOTLY_SYMBOLS`** (Marker-Symbol-Dropdown): Plotly bietet ~130+ Symbole (`scatter.marker.symbol`). Für das Dropdown wird eine **kuratierte Auswahl** der gebräuchlichsten übernommen (circle, square, diamond, cross, x, triangle-up/down/left/right, pentagon, hexagon, octagon, star, hourglass, bowtie, arrow-up/down, line-ew/ns, …) – übersichtlich und direkt plotly-kompatibel.
+- `to_js_dict()`/`to_dict()`: statt LWC-JS-Bridge werden die Werte **1:1 auf Plotly-HTML-Attribute** abgebildet (`line=dict(color, dash, width)` bzw. `mode="lines+markers"`/`"markers"` + `marker=dict(symbol, size, color)`).
 
-```text
-┌──────────────────────────────────────────────────────────────────┐
-│ Top-Zeile (bestehend): [Symbol] [TF] [★ Favoriten]  [Scan] [Opt] │
-├──────────────────────────────────────────────────────────────────┤
-│ Zeitraum: [Von ▾] [Bis ▾]  [1T][1W][1M][3M][YTD]  (Presets)      │
-├──────────────┬────────────┬──────────────────────────────────────┤
-│ ALGO-LISTE   │            │            CANVAS                     │
-│ (Checkboxen) │  SPLITTER  │     QWebEngineView / Plotly-HTML      │
-│ [x] SMA 20   │ (verschieb-│     ┌─ Candlestick (Kurs)            │
-│ [ ] SMA 50   │   bar)     │     │ + Overlays der AKTIVEN Algos    │
-│ [x] ATR 14   │            │     │ + Marker (Einstieg/Exit)        │
-│ [+] Add      │            │     └───────────────────────────────  │
-│              │            │     Legende, Sync-Zoom, Hover-X       │
-│ PARAMETER    │            │                                       │
-│ (für den     │            │                                       │
-│  angeklickten│            │                                       │
-│  Algo)       │            │                                       │
-│  period [__] │            │                                       │
-├──────────────┴────────────┴──────────────────────────────────────┤
-│ Statuszeile: Datenquelle, Kerzenzahl, Rechenzeit                  │
-└──────────────────────────────────────────────────────────────────┘
+**Ziel-Ablage in PyBack:** `ui/style_models.py` + `ui/style_picker_widget.py` (an PyBack-Namensraum angepasst, keine `chart/`-Pfade).
+
+### 2.2 UI: Alles in einem Widget
+
+- **`StylePickerWidget` = Button-Only** (Farb-Swatch-Icon + Vorschau-Text, z. B. `● 2px Solid` bzw. `● Circle`) – wird in der `ParamFormWidget` als **eine Zeile** pro Darstellungs-Parameter gerendert.
+- **Klick → `StylePickerDialog`** (modaler Popover) bündelt alle Einstellungen:
+  - **Farbe:** TradingView-Palette (16 Schnellfarben) + Hex/RGB-Eingabe + Transparenz-Slider (0–100 %) + `[Anpassen...]` → natives `QColorDialog.getColor()`. (Der native Dialog allein zeigt unter Win11/Qt6 Rendering-Macken → nur als Fallback.)
+  - **Linienmodus** (`style_type="line"`): Linienstärke `QSpinBox` (1–10 px) + Linienart `QComboBox` (6 Plotly-Dash-Werte).
+  - **Markermodus** (`style_type="marker"`): Markergröße `QSpinBox` (1–20 px) + Symbol-`QComboBox` (kuratierte Plotly-Symbole) – **genau das gewünschte Dropdown mit den verfügbaren Symbolen.**
+  - Optional `sichtbar`-Checkbox (`show_visibility=True`).
+- Farb-Logik wie in PyTrader: Alpha 255 → `#RRGGBB`, Alpha < 255 → `rgba(r,g,b,a)` – **1:1 kompatibel mit Plotly/HTML/CSS**.
+
+### 2.3 Schema-Konvention (Default in der Algo-Definition, PineScript-Input-Zone)
+
+Jeder Algo deklariert in `parameter_schema` einen **Darstellungs-Block** neben seinen Fach-Parametern (Konvention aus PyTrader `indicator_dialog_schema.py`):
+
+```python
+parameter_schema = {
+    # -- Fach-Parameter (bestehend) -----------------------------------
+    "period":   {"type": "int",  "default": 20, ...},
+    # -- Darstellung (NEU, Default in der Definition) ------------------
+    "line_color": {"type": "color", "default": "#ff7f0e",
+                   "style_type": "line", "allow_alpha": True},
+    # Sibling-Keys (Konvention 'color' -> 'style'/'width' bei line,
+    # 'shape'/'size' bei marker) – werden NICHT als eigene Controls
+    # gerendert, sondern ueber das StylePickerWidget mitgesetzt und
+    # flach in instance_params persistiert:
+    "line_style": {"type": "choice", "default": "solid",
+                   "options": ["solid", "dot", "dash", "longdash",
+                               "dashdot", "longdashdot"], "hidden": True},
+    "line_width": {"type": "int", "default": 2, "min": 1, "max": 10,
+                   "hidden": True},
+}
 ```
 
-**Widget-Beschreibung:**
+- **Nur der `color`-Key** wird als `StylePickerWidget` gerendert; die Sibling-Keys liegen als `"hidden": True` im Schema, werden über `get_style()` ausgelesen und flach in `instance_params` geschrieben.
+- **Default-Werte stehen damit exakt in der Algo-Definition** (Anforderung erfüllt).
+- **`style_type`** (`"line"` | `"marker"`) steuert Linien- vs. Marker-Modus. **Marker-Symbole kommen nur zum Tragen, wenn der Algo nicht als Linie definiert ist** (result_schema-`store != "series"` bzw. optionales `"render"`-Feld: `"line"` | `"marker"` | `"lines+markers"`).
+- Weitere Schema-Flags aus PyTrader: `allow_alpha`, `show_visibility`, `color_only` (reiner Farbwähler ohne Geschwister).
 
-| Widget | Details |
-|---|---|
-| **Zeitraum-Zeile** | Unter der Top-Zeile. `Von/Bis`-DateTimeEdit + Preset-Buttons `1T/1W/1M/3M/YTD`. Eigenständiges Widget `TimeRangeWidget`. |
-| **Algo-Liste** | Links oben. `QListWidget` **mit Checkboxen** (schnelles Ein-/Ausblenden in der Darstellung). Enthält **nur die hinzugefügten** Algos (nicht alle verfügbaren). |
-| **„+"-Add-Button** | Unter der Liste. Öffnet `AlgoPickerDialog`: **einfache Checkliste aus einem Dropdown** mit allen verfügbaren Algos (Registry). Algos können **mehrfach** ausgewählt werden (mehrere Instanzen desselben Algos mit unterschiedlichen Parametern). |
-| **Kontextmenü** | An Listeneinträgen: **„Entfernen"** löscht den Eintrag aus der Liste. Zusätzlich Checkbox in der Auswahlliste für schnelles Switchen der Darstellung. |
-| **Parameter-Feld** | Links unten. `ParamFormWidget` – zeigt die Parameter des **gerade angeklickten** Listeneintrags, dynamisch aus dessen `parameter_schema` generiert (SpinBoxen/Checkboxen). |
-| **Canvas** | Rechts. `QWebEngineView` mit Plotly-HTML (offline, plotly.js eingebettet), Dark-Theme passend zur App. |
-| **Splitter** | Zwischen linkem Panel und Canvas: **verschiebbar** (`QSplitter`), Position wird persistiert. |
+### 2.4 Datenfluss & Integration (PyBack)
 
-**Wechselwirkung:**
-- Klick auf Listeneintrag (ohne Checkbox) → Parameter-Form wird befüllt.
-- Checkbox an/aus → Overlay wird im Canvas ein-/ausgeblendet (ohne Neuberechnung der anderen).
-- Parameter-Änderung → nur der betroffene Algo wird neu berechnet (Debounce 300 ms).
-
-### 2.3 Architektur (Logik komplett außerhalb von `main_win`)
-
-```text
-main_win.py  = NUR Zusammenbau der Controls + 1 Controller-Zeile
-   │
-   ├── ui/time_range_widget.py       (Zeitraum-Picker, Signal range_changed)
-   ├── ui/param_form_widget.py       (Schema→Widgets, Signal params_changed)
-   ├── ui/algo_picker_dialog.py      ("+"-Dialog, alle Algos auswählen)
-   ├── ui/playground_chart_service.py(Plotly-HTML-Builder, nutzt Overlay-Hooks)
-   │
-   └── controllers/algo_playground_controller.py  (QObject, Debounce 300ms,
-            hält Zustand: active_algos, selected_algo, params, range)
-            ├── nutzt repositories/market_data_repository.py (Daten, existiert!)
-            ├── nutzt algos/algo_registry.py (dynamischer, defensiver Scan)
-            └── startet workers/playground_worker.py (QThread, Rechnung)
-```
-
-**Regeln:**
-- `main_win.py` kennt **keine** Berechnung, **keine** Registry, **kein** DuckDB – nur `AlgoPlaygroundController(self)`.
-- Algos bleiben **vektorisiert** (NumPy/Pandas), kein `iterrows`.
-- Registry-Scan ist **defensiv**: ein kaputtes Modul wird übersprungen, der Rest funktioniert.
-- UI-Änderungen werden **nur durch Code-Inspektion + gezielte Tests** abgesichert (kein GUI-Ausführen).
-
-### 2.4 Daten-Logik Zeitraum vs. Timeframe
-
-- Die **Kerzen werden immer geladen wie aktuell im Fenster bei der eingestellten TF** (Symbol/TF-Auswahl aus der Top-Zeile).
-- Der **Zeitraum-Picker bestimmt nur den sichtbaren Ausschnitt** des bereits geladenen Datensatzes – kein Neuladen aus DuckDB bei jedem Preset-Klick, sondern client-seitiges Slicen des im Controller gecachten DataFrames.
-- Beim Wechsel von Symbol oder TF wird der DataFrame einmalig aus `MarketDataRepository` geladen und gecacht; danach arbeiten alle Playground-Berechnungen auf diesem Cache.
+1. **`ParamFormWidget`** erweitert: neuer Schema-Typ `"color"` → `StylePickerWidget`-Zeile; `_ctrl_value` liest `ctrl.get_style().color` zurück, die Sibling-Keys werden beim `params_changed`-Emit mitgeschrieben.
+2. **`instance_params`** (flaches Dict je Instanz) enthält damit automatisch `line_color`/`line_style`/`line_width` (bzw. Marker-Äquivalente) – **Persistenz läuft über den bestehenden Save/Restore-Roundtrip, kein Zusatzaufwand.**
+3. **Controller `_build_instance_traces`**: Farbe/Linienart/Stärke/Symbol aus `instance_params[instance_key]` statt aus `_color_for_instance()` (Farbzyklus bleibt **Fallback**, wenn kein Stil gesetzt/gespeichert ist – Abwärtskompatibilität für alte States).
+4. **`_js_add_overlay`/`_js_update_overlay`** (inkrementelle JS-Traces): `line=dict(color, dash, width)` bzw. `marker=dict(symbol, size)` ins Trace-JSON übernehmen (statt hartem `width=1.5`).
+5. **`PlaygroundChartService.build_candlestick_html`**: Overlay-Dict erhält `dash`/`width`/`symbol`/`size`-Felder; `mode="lines"` bzw. `"lines+markers"`/`"markers"` je nach render-Typ; `line`/`marker`-Attribute werden gesetzt.
 
 ---
 
-## 3. Schrittanleitung (mit UI-Review-Stopps nach jedem UI-Schritt)
+## 3. Schrittanleitung (mit UI-Review-Stopps)
 
-### Phase 0 – Fundamente (kein UI)
-- [x] 0.1 `algos/algo_registry.py` erstellen (dynamischer, defensiver Scan von `alg_*.py`; Registry liest `parameter_schema` + Overlay-Hook aus)
-- [x] 0.2 Ordner `controllers/` und `workers/` anlegen
-- [x] 0.3 Test in `test/test.py`: Registry findet die alg_-Module (seit Phase 5: alg_sma) → sauberer Zustand
-- [x] 0.4 **Commit** (`playground_step1`)
+### Phase 7 – Algo-Darstellungs-Picker (Stil-Widget aus PyTrader übernehmen)
 
-### Phase 1 – Basis-UI (UI-Review durch Anwender)
-- [x] 1.1 `TimeRangeWidget` erstellen (Von/Bis + Presets 1T/1W/1M/3M/YTD)
-- [x] 1.2 In `main_win` unter der Top-Zeile einbauen
-- [ ] **STOPP → UI-Review:** Zeitraum-Zeile OK? Position, Größe, Presets?
-
-### Phase 2 – Algo-Liste + Add-Dialog (UI-Review)
-- [x] 2.1 `AlgoPickerDialog` erstellen (Dropdown-Checkliste, Mehrfachauswahl, „Übernehmen")
-- [x] 2.2 `QListWidget` mit Checkboxen im linken Panel + „+"-Button
-- [x] 2.3 Kontextmenü „Entfernen" an Listeneinträgen
-- [ ] **STOPP → UI-Review:** Listenlayout, Checkbox-Interaktion, Dialog-Größe, Kontextmenü?
-
-### Phase 3 – Parameter-Form (UI-Review)
-- [x] 3.1 `ParamFormWidget` erstellen (generiert aus `parameter_schema`)
-- [ ] **STOPP → UI-Review:** Anordnung der Felder, SpinBoxen/Checkboxen/Typen?
-
-### Phase 4 – Canvas-Basics (UI-Review)
-- [x] 4.1 `PlaygroundChartService`: erstmal **nur Candlestick** + Zeitraum-Slice
-- [x] 4.2 `QWebEngineView`-Canvas + Dark-Theme einbauen (offline plotly.js)
-- [ ] **STOPP → UI-Review:** Canvas-Darstellung, Dark-Theme, Zoom/Sync?
-
-### Phase 5 – Erster echter Algo (Vertrag festlegen)
-- [x] 5.1 Beispiel-Algo `algos/alg_sma.py` mit Overlay-Hook + `parameter_schema`
-- [x] 5.2 Overlay auf Canvas + Param-Änderung → Neuberechnung (Debounce)
-- [x] 5.3 Overlay-Farben: erstmal automatisch (farbiger Zyklus); später je Algo einstellbar
-- [ ] **STOPP → UI-Review:** Overlay-Sichtbarkeit, Parameter-Live-Update, Farbzyklus?
-
-### Phase 6 – Integration & Härtung
-- [x] 6.1 `PlaygroundWorker` (QThread, UI friert nicht)
-- [x] 6.2 Symbol/TF-Wechsel + Zeitraum → Daten-Slice aus Cache/MarketDataRepository
-- [x] 6.3 **Persistenz (Anforderung 0):** Alle Playground-Einstellungen (aktive Algos inkl. Parameter, Zeitraum, Splitter-Position) werden mit den Fensterdaten gespeichert und beim Neustart restored
-- [ ] **STOPP → UI-Review:** Gesamter Workflow, Performance bei vielen Algos, Persistenz nach Neustart?
+- [ ] 7.1 **Commit vor Schritt** (`playground_step7`): sauberer Ausgangspunkt
+- [ ] 7.2 `ui/style_models.py` anlegen (Plotly-Version: `LineStyle`/`MarkerStyle`, `LINE_STYLES` = 6 Plotly-Dash-Werte, `PLOTLY_SYMBOLS` = kuratierte Auswahl, `to_dict`/`from_dict`)
+- [ ] 7.3 `ui/style_picker_widget.py` anlegen (aus PyTrader kopiert, angepasst: Imports `ui.style_models`, `LINE_STYLES`/`PLOTLY_SYMBOLS`, Plotly-kompatible Werte)
+- [ ] 7.4 `ParamFormWidget`: Schema-Typ `"color"` → `StylePickerWidget` rendern; `_ctrl_value` + Sibling-Keys (`hidden`) beim Params-Emit mitnehmen
+- [ ] 7.5 `PlaygroundChartService`: Overlay-Trace verarbeitet `dash`/`width`/`symbol`/`size` + `render`-Modus (lines/lines+markers/markers)
+- [ ] 7.6 Controller: `_build_instance_traces`/`_js_add_overlay`/`_js_update_overlay` nutzen Stil-Params; Farbzyklus nur als Fallback
+- [ ] 7.7 `alg_sma` (Referenz-Algo): Darstellungs-Defaults (`line_color`/`line_style`/`line_width`) ins `parameter_schema`
+- [ ] 7.8 Test in `test/test.py`: Stil-Roundtrip (Defaults aus Schema, Widget-Read, Sibling-Keys in `instance_params`, Plotly-HTML enthält `dash`/`width`/`symbol`), Persistenz-Save/Restore
+- [ ] 7.9 **Commit** + Implementierungs-Log in Kapitel 5
+- [ ] **STOPP → UI-Review:** StylePicker-Button + Dialog (Farbe, Linienart, Stärke, Symbol-Dropdown), Persistenz nach Neustart?
 
 ---
 
@@ -152,12 +111,7 @@ main_win.py  = NUR Zusammenbau der Controls + 1 Controller-Zeile
 | # | Frage | Entscheidung |
 |---|---|---|
 | 0 | Persistenz | **Alle Einstellungen werden mit den Fensterdaten gespeichert und beim Neustart restored** |
-| 1 | Linkes Panel | **Splitter** (verschiebbar), Position wird persistiert |
-| 2 | „+"-Dialog | **Einfache Checkliste aus einem Dropdown**; Algos können **mehrfach** ausgewählt werden (versch. Parameter) |
-| 3 | Overlay-Farben | Erstmal **automatisch** (farbiger Zyklus); später auch je Algo einstellbar |
-| 4 | Zeitraum-Presets | **1T/1W/1M/3M/YTD**; Kerzen werden **immer geladen wie aktuell bei der eingestellten TF** (Zeitraum = nur sichtbarer Ausschnitt, kein Neuladen) |
-| 5 | Entfernen/Switching | **Kontextmenü „Entfernen"** + zusätzlich **Checkbox in der Auswahlliste** für schnelles Switchen in der Darstellung |
-| – | Playground-Zweck | Nur spielerisches Testen auf Kerzen (Overlays). Echtes vbt-Backtesting bekommt ein **eigenes Fenster** mit Massentests |
+| 1 | Darstellungs-Widget | **Ein kompaktes Stil-Widget** (Farb-Swatch-Button → Dialog) je Algo: Farbe + Linienart + Stärke; **Symbol als Dropdown** bei Marker-Algos (falls nicht als Linie definiert). Defaults in der Algo-Definition (`parameter_schema`), Persistenz pro Instanz über `instance_params`. **Übernahme aus PyTrader** (`style_picker_widget` + `style_models`), angepasst auf Plotly |
 
 ---
 
@@ -165,21 +119,6 @@ main_win.py  = NUR Zusammenbau der Controls + 1 Controller-Zeile
 
 > Format: `**DD.MM.YYYY, HH:MM – <ID> <Beschreibung>**`. Einträge erfolgen erst nach expliziter Freigabe des Anwenders.
 
-- **17.08.2026, 10:56 – Phase 0** Algo-Registry (`algos/algo_registry.py`): dynamischer, defensiver Scan aller `alg_*.py`-Module; liest `parameter_schema` + Overlay-Hook; 0-Zustand sauber getestet (Commit `93f7b91`).
-- **17.08.2026, 10:59 – Phase 1** `TimeRangeWidget` (Von/Bis + Presets 1T/1W/1M/3M/YTD) in `main_win` eingebaut (Commit `6fcbdef`); UI-Feinschliff: schmale Preset-Buttons, Log/Statuszeile nach unten (Commit `3643e08`).
-- **17.08.2026, 11:07 – Phase 2** `AlgoListPanel` (QListWidget mit Checkboxen, „+"-Button, Kontextmenü „Entfernen") + `AlgoPickerDialog` (Dropdown-Checkliste, Mehrfachauswahl) (Commit `b539876`).
-- **17.08.2026, 11:11–11:23 – Phase 3** `ParamFormWidget` (Schema→Widgets, Params-Flow pro Instanz); vertikaler Splitter im linken Panel + Save/Restore aller Werte; „+" oben statt Label; Statuszeile rechts neben „+" (Commits `645d02b`, `dee3acf`, `f7b4103`, `5067822`).
-- **17.08.2026, 11:27–12:00 – Phase 4** Canvas-Basics: `PlaygroundChartService` (Candlestick + Zeitraum-Slice, Dark-Theme) + QWebEngineView-Canvas; Bugfixes (plotly.js als Datei statt Inline, Cache-Reload nach Scan, Lücken ausblenden); TradingView-Verhalten (scrollZoom/pan), Preisachse rechts, Canvas füllt gesamten Bereich (Commits `27bd3a1`–`328e9f3`).
-- **17.08.2026, 12:15 – Phase 5** Erster echter Algo + Overlays: `algos/alg_sma.py` (Definitions-Zone mit `parameter_schema` + `result_schema`, store='series'), Registry liest `result_schema`/`has_overlay`, `AlgoResultsRepository` (Persistenz in `algo_results`), Controller-Overlay-Flow (Berechnung via `get_overlay_series`, Debounce 300 ms, Checkbox-Sichtbarkeit, Farbzyklus, Zeitraum-Slice, DB-Delete bei Entfernen) (Commit `7e1a0bf`).
-  * **Verifikation:** `test/test.py` 16/16 grün (inkl. Phase-5-Tests: alg_sma-Overlay-Serie, Repository-Roundtrip in Test-DB, kompletter Controller-Overlay-Flow); `py_compile` auf allen geänderten Dateien OK.
-- **17.08.2026 – Phase 5b (Anwender-Anforderungen, 17.08.2026)** Picker vereinfacht + RAM-only: `AlgoPickerDialog` = einfache Liste aller Algos (Klick übernimmt sofort als **UNCHECKED** Instanz, Esc schließt, alle Buttons entfernt); Overlay-Berechnung **nur im RAM** (keine DB-Persistenz mehr – `AlgoResultsRepository` bleibt für eine spätere Phase); Param-Änderung → Debounce 300 ms, Neuberechnung nur im RAM (Commit `3727ee5`).
-- **17.08.2026 – Phase 6-Ergänzung** Plotly-View-Persistenz: Der aktuelle Canvas-View (Zoom/Skala, x/y-Range aus `_fullLayout`) wird in `save_state` als `view` mitgespeichert und nach `restore_state` beim ersten Render mit Daten per `Plotly.relayout` wieder angewendet. Zusätzlich Zoom-Kontinuität: Checkbox-/Param-Änderungen setzen den View nicht mehr zurück (`preserve_view`), Zeitraum-/Symbol-/Sync-Wechsel respektieren den neuen Datenkontext (Commit `5993685`).
-  * **Verifikation:** `test/test.py` 17/17 grün (inkl. neuem Phase-6-Test: View speichern/restoren + Kontinuität via Fake-QWebEnginePage); `py_compile` OK.
-- **17.08.2026 – Phase 6b (Anwender-Bugfixes, 17.08.2026)** Zwei Problemfälle behoben: **(1) „Werte des Plotly-Views werden nicht gespeichert/restored"** – Ursache war der `_capture_view`-Aufruf im `closeEvent` (nested QEventLoop unzuverlässig) plus `runJavaScript` direkt nach `setHtml` (lief auf der alten Seite). Fix: Der View wird jetzt **ins HTML eingebettet** (`build_candlestick_html(..., initial_view=...)` → eingebettetes Poll-Skript mit `Plotly.relayout`, kein Race); ein periodischer `_poll_view`-Timer (2 s, plus singleShot 500 ms nach jedem Render) cached den View in `_last_view`, `save_state` nutzt nur noch den Cache (kein JS im closeEvent); `_pending_view` wird **nur konsumiert, wenn das HTML das View-Skript tatsächlich enthält** (leere Render vor dem ersten Daten-Laden verwerfen den Restore-View nicht mehr). **(2) „Bei Check/Uncheck wird Grafik komplett neu aufgebaut"** – Fix: Overlays werden **inkrementell per JS** geändert (`Plotly.addTraces`/`deleteTraces` statt `setHtml`): Add = UNCHECKED + RAM-Berechnung ohne Render, Checkbox = nur Traces ein/aus, Param-Änderung (Debounce) = Traces via JS aktualisiert, Entfernen = Traces via JS gelöscht; `_overlay_order` (Trace-Index = 1 + Position) hält die sichtbare Reihenfolge (Commit `f0d86d0`).
-  * **Verifikation:** `test/test.py` 17/17 grün – Phase-5.4/6-Test (inkrementeller Overlay-Flow: setHtml-Konstanz via `base_html_calls`-Baseline, addTraces/deleteTraces-Zähler, `_overlay_order`) und Phase-6-Test (View-Persistenz: `_poll_view`-Cache, eingebettetes View-Skript im HTML, preserve-Kontinuität, kein View-Skript ohne gespeicherten View); `py_compile` auf Controller + Chart-Service OK.
-- **17.08.2026 – Phase 6.1** `workers/playground_worker.py` (QThread, UI friert nicht): Die Overlay-Berechnung (`get_overlay_series`) läuft jetzt in einem Hintergrund-Worker statt im UI-Thread. Der Worker erhält pro Auftrag die Algo-Klasse (aus der gecachten Registry), instance_key, Parameter und den Kerzen-DataFrame und emittiert das Ergebnis (`overlay_computed(generation, instance_key, series)` bzw. `overlay_failed`). Der Controller startet pro Neuberechnung einen Worker, verwirft veraltete Ergebnisse über eine **Generationsnummer pro Instanz** (`_overlay_generation`) und aktualisiert sichtbare Overlays erst beim Eintreffen des Ergebnisses inkrementell per JS (`_on_overlay_computed`); `_recalc_all_overlays` leert den alten Datenkontext vor dem asynchronen Neustart. Worker-Referenzen werden über `finished`→`_on_worker_finished` aufgeräumt (Commit `6f50a68`).
-  * **Verifikation:** `test/test.py` 18/18 grün – neu: `test_phase61_playground_worker` (Worker liefert pd.Series + generation/instance_key im Signal; Fehlerfall emittiert `overlay_failed`); `test_phase5_controller_overlay_flow` auf asynchronen Worker-Flow umgestellt (Event-Loop-Pump `_wait_until` für Worker-Ergebnisse); `py_compile` auf Worker + Controller + test.py OK.
-- **17.08.2026 – Bugfix-Runde 1 (Anwender-Bericht)** Symbol/TF/Datum/Plotly-View speichern + restoren (Commit `07a1cbf`): **(1)** Synchroner QEventLoop in `_poll_view` blockierte bis 800ms alle 2s die UI (Konflikt mit QWebEngineView + QDateTimeEdit-Popups) → View-Lesen jetzt **asynchron** (`runJavaScript`-Callback in `_on_view_read`, kein nested exec); `TimeRangeWidget` löst `dateTimeChanged` UND `editingFinished` aus (mit `_emit_range`-Dedup gegen Doppel-Render). **(2)** Symbol/TF wurden nicht gespeichert → `save_state` speichert `'symbol'`+`'timeframe'`, `restore_state` stellt sie signal-blockiert in den Combos wieder her (kein vorzeitiger Render pro Combo-Change). **(3)** Datumseinstellungen wurden vom Startup-Sync überschrieben → `_load_candles` merkt `_last_cache_max` (Max-Epoch des alten Caches); `_extend_range_to_latest` erweitert **nur am Datumsrand** (to >= alter Cache-Max), nach Restore/Neustart bleibt der Anwender-Zeitraum exakt erhalten. **(4)** View blieb durch Bug-1 leer → async View-Read liefert Zoom/Skala zuverlässig; `save_state` legt ihn ab, `restore_state` merkt ihn als `_pending_view`.
-  * **Verifikation:** `test/test.py` 19/19 grün – neu `test_phase6_persist_symbol_tf_range_view` (Roundtrip Symbol/TF/Datum/View + Range-Erhalt am Rand vs. gewählter Zeitraum); Phase-6-View-Test auf async umgestellt; `py_compile` OK.
-- **17.08.2026 – Bugfix-Runde 2 (Anwender-Bericht)** Datumsfelder setzen die Plotly-X-Skala + View-Persistenz zuverlässig (Commit `955a660`): **(1)** „Angaben der Datumsfelder setzen nicht die Skala/Zeitraum in plotly" → `build_candlestick_html` setzt die X-Achse **explizit** als `xaxis.range`: gespeicherter View (`initial_view["xrange"]`) oder exakt `[from_epoch, to_epoch]` – die Datumsfelder sind damit massgebend für die Skala (kein stilles Autorange mehr); yrange analog. Das eingebettete Post-Render-Skript (`_build_view_script`, `Plotly.relayout`-Polling) wurde **entfernt** – der View steckt direkt im Figure-Layout (kein Race nach `setHtml`, Marker `VIEW_SCRIPT_MARKER` entfällt). **(2)** View/letzte Einstellungen wurden nicht zuverlässig gespeichert/restored → `_JS_READ_VIEW` liefert die xrange als **Wanduhr-naive** `"YYYY-MM-DDTHH:MM:SS"`-Strings (via `getFullYear/getMonth/...` statt `toISOString`, sonst Zeitzonen-Offset zwischen Achse und Kerzen); View-Timer 500ms statt 2s; `save_state` macht einen finalen **begrenzten Event-Pump (max. 300ms, `QApplication.processEvents()`, kein QEventLoop)** für den allerletzten Zoom; `_on_range_changed` verwirft `_pending_view` (Datumsfelder massgebend); `_pending_view` wird nur bei echtem Render konsumiert (`_EMPTY_MARKER`-Check statt VIEW_SCRIPT_MARKER).
-  * **Verifikation:** `test/test.py` 19/19 grün – `test_phase6_view_persist` umgestellt: `_FakePage` liefert Wanduhr-Format; kein `Plotly.relayout` im HTML (View im Layout); gespeicherte xrange/yrange im HTML; preserve-Render nutzt `_last_view`; **neuer „Ohne View"-Block** prüft, dass das Bis-Datum (+3600s, nach letzter Kerze +3540s) als `xaxis.range` im HTML steckt (Datumsfelder massgebend); `test_phase6_persist_symbol_tf_range_view`-`_FakePage` auf Wanduhr-Format umgestellt (Einrückungsfehler dabei behoben); `py_compile` auf Controller + Chart-Service + test.py OK.
+- **17.08.2026 – Phase 7-Konzept** Algo-Darstellungs-Picker (Farbe/Linienart/Stärke/Symbol) dokumentiert: Übernahme des PyTrader-`StylePickerWidget`/`StylePickerDialog`/`style_models` (angepasst auf Plotly: 6 Dash-Werte, kuratierte Plotly-Symbole als Dropdown), Schema-Typ `"color"` in `ParamFormWidget`, Sibling-Keys-Konvention, Persistenz über `instance_params`, Farbzyklus als Fallback (Commit folgt nach Umsetzung).
+  * **Kein Coding** – reine Konzept-/Schritt-Dokumentation (Anwender-Anforderung „erstmal prüfen").
+
