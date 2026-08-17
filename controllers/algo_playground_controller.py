@@ -23,10 +23,11 @@ Der Controller kennt main_win NICHT als Modul – er erhaelt das View-Objekt
 (duck-typed) ueber den Konstruktor.
 """
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QUrl
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
@@ -307,7 +308,12 @@ class AlgoPlaygroundController(QObject):
         self._render_chart()
 
     def _render_chart(self) -> None:
-        """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View."""
+        """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View.
+
+        Die setHtml-BaseUrl zeigt auf das assets/-Verzeichnis, damit die
+        lokale plotly.min.js-Datei geladen werden kann (Bugfix 17.08.2026:
+        ohne baseUrl laedt QWebEngineView keine file://-Scripts).
+        """
         canvas = getattr(self.ui, "canvas", None)
         if canvas is None:
             return  # kein Canvas (z.B. Tests mit FakeView)
@@ -317,7 +323,11 @@ class AlgoPlaygroundController(QObject):
         from_epoch, to_epoch = self.ui.time_range.get_range()
         html = self._chart_service.build_candlestick_html(
             self._candles_cache, from_epoch, to_epoch, symbol, timeframe)
-        canvas.setHtml(html)
+
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "assets")
+        canvas.setHtml(html, QUrl.fromLocalFile(
+            os.path.normpath(assets_dir).replace("\\", "/") + "/"))
 
     # ------------------------------------------------------------------
     # Interne Helfer

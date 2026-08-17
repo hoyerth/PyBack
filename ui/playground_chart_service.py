@@ -10,17 +10,28 @@ standalone Plotly-HTML mit Candlestick + Dark-Theme und Zeitraum-Slice.
   * Zeitraum-Slice: der sichtbare Ausschnitt [from_epoch, to_epoch] wird
     client-seitig aus dem bereits gecachten DataFrame geschnitten – kein
     Neuladen aus DuckDB (Konzept 2.4).
-  * plotly.js wird OFFLINE eingebettet (include_plotlyjs=True), der HTML-
-    String ist standalone im QWebEngineView renderbar.
+  * plotly.js wird OFFLINE als LOKALE DATEI referenziert (assets/plotly.min.js,
+    aus plotly/package_data kopiert) statt inline eingebettet zu werden.
+    Grund (Bugfix 17.08.2026): QWebEngineView.setHtml() rendert HTML mit
+    4,8 MB Inline-JS NICHT zuverlaessig (Page bleibt auf dem vorherigen
+    Inhalt stehen) – die Datei-Referenz haelt das setHtml-HTML klein (~30 KB)
+    und rendert stabil.
   * Dark-Theme passend zur App (plotly_dark + dunkler Body-Hintergrund).
 
 Nur Build-Logik (SRP): KEIN Qt-Import, KEIN DuckDB-Zugriff.
 """
 
+import os
 from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
+
+# Pfad zur lokalen (offline) plotly.min.js – relativ zum ui/-Paket.
+_PLOTLY_JS_REL = os.path.join("..", "assets", "plotly.min.js")
+_PLOTLY_JS_ABS = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), _PLOTLY_JS_REL))
+_PLOTLY_JS_URL = _PLOTLY_JS_ABS.replace("\\", "/")
 
 # Dunkler Body-Hintergrund passend zum plotly_dark-Template (#111418 ist die
 # plotly_dark-Paper-Farbe, damit der Canvas nahtlos dunkel wirkt).
@@ -60,7 +71,7 @@ class PlaygroundChartService:
             timeframe:  Anzeige-Timeframe (Titel).
 
         Returns:
-            Standalone-HTML-String (plotly.js offline eingebettet).
+            Standalone-HTML-String (plotly.js offline als Datei referenziert).
         """
         if candles_df is None or candles_df.empty:
             return _EMPTY_HTML
@@ -106,11 +117,13 @@ class PlaygroundChartService:
         )
 
         plot_div = fig.to_html(
-            full_html=False, include_plotlyjs=True, config={"displaylogo": False})
+            full_html=False, include_plotlyjs=False,
+            config={"displaylogo": False})
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title></head>
 <body style="{_BODY_STYLE}">
+<script src="{_PLOTLY_JS_URL}"></script>
 {plot_div}
 </body>
 </html>"""
