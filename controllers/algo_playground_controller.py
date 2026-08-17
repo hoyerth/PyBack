@@ -10,8 +10,10 @@ Basics – Daten-Cache (Konzept 2.4: einmalig pro Symbol/TF aus dem
 MarketDataRepository laden), Zeitraum-Slice (client-seitig) und Candlestick-
 Render in den QWebEngineView. Phase 5: Algo-Overlays – get_overlay_series-
 Hooks werden nach Param- oder Daten-Aenderung (Debounce 300ms) vektorisiert
-berechnet, in app_data.duckdb persistiert (result_schema, store='series')
-und als farbige Linien ueber die Candles gelegt (Checkbox ein/aus).
+berechnet und als farbige Linien ueber die Candles gelegt (Checkbox ein/aus).
+USER-REQ (17.08.2026): NUR RAM-Berechnung + Plot (keine DB-Persistenz,
+AlgoResultsRepository folgt in einer spaeteren Phase); der "+"-Dialog ist
+eine einfache Liste, Klick uebernimmt den Algo als UNCHECKED Instanz.
 
 Verantwortlich (SRP/IoC):
   * Registry einmalig laden (AlgoRegistry.discover_algos)
@@ -34,7 +36,6 @@ from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
-from repositories.algo_results_repository import AlgoResultsRepository
 from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
 from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
@@ -67,13 +68,15 @@ class AlgoPlaygroundController(QObject):
         self._chart_service = PlaygroundChartService()
         self._data_repo = MarketDataRepository()
 
-        # Phase 5: Overlay-Ergebnisse + Ergebnis-Persistenz + Debounce.
+        # Phase 5: Overlay-Ergebnisse (RAM-only, USER-REQ 17.08.2026) +
+        # stabile Farben + Debounce. KEINE DB-Persistenz (kommt spaeter
+        # ueber AlgoResultsRepository in einer weiteren Phase).
         self._overlays: Dict[str, Dict[str, pd.Series]] = {}
         # Stabile Overlay-Farbe je Instanz (Farbzyklus, Phase 5.3).
         self._overlay_colors: Dict[str, str] = {}
-        self._results_repo = AlgoResultsRepository()
         # Debounce (300ms, Konzept 2.2): nur der betroffene Algo wird
-        # nach Parameter-Aenderung neu berechnet.
+        # nach Parameter-Aenderung neu berechnet (kurze Wartezeit, damit
+        # schnelles Eintippen nicht jede Zwischenstufe berechnet).
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(300)
@@ -113,45 +116,45 @@ class AlgoPlaygroundController(QObject):
     # Events
     # ------------------------------------------------------------------
     def _on_add_requested(self) -> None:
-        """'+' geklickt: AlgoPickerDialog oeffnen und Auswahl uebernehmen."""
+        """'+' geklickt: AlgoPickerDialog oeffnen, gewaehlten Algo uebernehmen.
+
+        USER-REQ (17.08.2026): Der Dialog ist eine einfache Liste aller
+        Algos; ein Klick uebernimmt den Algo sofort als UNCHECKED Instanz
+        (Overlay zunaechst unsichtbar – erst nach Checkbox-Aktivierung).
+        Esc schliesst ohne Uebernahme. Die Instanz wird im RAM berechnet
+        (keine DB-Persistenz).
+        """
         if not self.registry:
             self.ui.status_label.setText(
                 "Status: keine Algos verfuegbar (algos/ ist leer)")
             return
         dlg = AlgoPickerDialog(self.registry, self.ui)
         if dlg.exec() == QDialog.Accepted:
-            chosen = dlg.selected_algo_ids()
-            new_instances = []
-            for algo_id in chosen:
-                meta = self.registry.get(algo_id, {})
-                key = self.ui.algo_panel.add_algo(algo_id, meta.get("name"))
-                new_instances.append((algo_id, key))
+            algo_id = dlg.selected_algo_id()
+            if algo_id is None:
+                return
+            meta = self.registry.get(algo_id, {})
+            key = self.ui.algo_panel.add_algo(
+                algo_id, meta.get("name"), checked=False)
             self.active_algos = list(self.ui.algo_panel.algo_ids())
-            # Neue Instanzen mit Schema-Defaults initialisieren.
-            for algo_id, key in new_instances:
-                self.instance_params[key] = self._schema_defaults(algo_id)
-                # Phase 5: Overlay sofort berechnen + in DB speichern.
-                self._recalc_overlay(key)
+            # Neue Instanz mit Schema-Defaults initialisieren.
+            self.instance_params[key] = self._schema_defaults(algo_id)
+            # Overlay im RAM berechnen (nicht sichtbar bis Checkbox an).
+            self._recalc_overlay(key)
             self.ui.status_label.setText(
-                f"Status: {len(chosen)} Algo(s) hinzugefuegt "
-                f"(gesamt {len(self.active_algos)})")
-            # Canvas neu rendern, damit die neuen Overlays sichtbar werden.
+                f"Status: {algo_id} hinzugefuegt "
+                f"(unsichtbar – Checkbox aktivieren)")
+            # Canvas neu rendern, damit die Liste/Overlays aktuell sind.
             self._render_chart()
 
     def _on_algo_removed(self, algo_id: str, instance_key: str) -> None:
-        """Kontextmenue 'Entfernen': Zustand nachfuehren (Phase 5: + DB)."""
+        """Kontextmenue 'Entfernen': Zustand nachfuehren (RAM-only)."""
         # Parameter/Overlay/Farbe der entfernten Instanz verwerfen.
         self.instance_params.pop(instance_key, None)
         self._overlays.pop(instance_key, None)
         self._overlay_colors.pop(instance_key, None)
-        # Gespeicherte Ergebnisse aus app_data.duckdb loeschen (Phase 5).
-        try:
-            self._results_repo.delete_for_instance(
-                algo_id, instance_key,
-                getattr(self.ui, "current_symbol", lambda: "?")(),
-                getattr(self.ui, "current_timeframe", lambda: "?")())
-        except Exception as exc:
-            print(f"WARN [Playground] Ergebnis-Delete {instance_key}: {exc}")
+        # USER-REQ: keine DB-Persistenz in Phase 5 (kommt spaeter) –
+        # daher hier auch kein Repository-Delete noetig.
         if self.selected_instance == instance_key:
             self.selected_instance = None
             self.ui.param_form.set_schema({})
@@ -429,12 +432,14 @@ class AlgoPlaygroundController(QObject):
             self._recalc_overlay(key)
 
     def _recalc_overlay(self, instance_key: str) -> None:
-        """Berechnet die Overlay-Serien EINER Instanz (vektorisiert, Phase 5).
+        """Berechnet die Overlay-Serien EINER Instanz im RAM (vektorisiert).
 
         Holt algo_id + Parameter, instanziiert den Algo und ruft
         `get_overlay_series(self._candles_cache)` auf. Ergebnis wird
-        gehalten in self._overlays[instance_key] und – fuer Felder mit
-        store='series'/'both' – in der DB persistiert (AlgoResultsRepository).
+        gehalten in self._overlays[instance_key].
+
+        USER-REQ (17.08.2026): NUR RAM-Berechnung + Plot – KEINE DB-
+        Persistenz (AlgoResultsRepository folgt in einer spaeteren Phase).
         """
         panel = self.ui.algo_panel
         keys = panel.instance_keys()
@@ -466,24 +471,8 @@ class AlgoPlaygroundController(QObject):
             self._overlays[instance_key] = {}
             return
 
-        overlays = dict(series_dict) if isinstance(series_dict, dict) else {}
-        self._overlays[instance_key] = overlays
-
-        # DB-Persistenz (Phase 5): nur store='series'|'both'-Felder.
-        symbol = getattr(self.ui, "current_symbol", lambda: "?")()
-        timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
-        result_schema = entry.get("result_schema") or {}
-        for name, spec in result_schema.items():
-            spec = spec if isinstance(spec, dict) else {}
-            store = str(spec.get("store", "series"))
-            series = overlays.get(name)
-            if store in ("series", "both") and series is not None:
-                try:
-                    self._results_repo.save_series(
-                        algo_id, instance_key, symbol, timeframe,
-                        name, series)
-                except Exception as exc:
-                    print(f"WARN [Playground] DB-Save {algo_id}.{name}: {exc}")
+        self._overlays[instance_key] = (
+            dict(series_dict) if isinstance(series_dict, dict) else {})
 
     def _color_for_instance(self, instance_key: str) -> str:
         """Weist einer Instanz eine stabile Overlay-Farbe zu (Farbzyklus)."""

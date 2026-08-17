@@ -84,8 +84,9 @@ class AlgoListPanel(QWidget):
     # API
     # ------------------------------------------------------------------
     def add_algo(self, algo_id: str, display_name: Optional[str] = None,
-                 instance_key: Optional[str] = None) -> str:
-        """Fuegt einen Algo als (standardmaessig aktivierten) Eintrag hinzu.
+                 instance_key: Optional[str] = None,
+                 checked: bool = True) -> str:
+        """Fuegt einen Algo als Listeneintrag hinzu.
 
         Args:
             algo_id: Registry-ID des AlgOS.
@@ -94,6 +95,10 @@ class AlgoListPanel(QWidget):
                 (Restore). Ohne Angabe wird eine neue eindeutige Key erzeugt;
                 bei vorhandener Key wird der Zaehler ueber ihr numerisches
                 Suffix angehoben, damit keine Kollisionen entstehen.
+            checked: Sichtbarkeits-Checkbox direkt setzen. USER-REQ
+                (17.08.2026): per "+"-Dialog hinzugefuegte Algos starten
+                UNCHECKED (Overlay erst nach Checkbox-Aktivierung sichtbar);
+                Restore nutzt den gespeicherten Zustand (Default True).
 
         Returns:
             instance_key des Eintrags (eindeutig, fuer Duplikate).
@@ -115,8 +120,8 @@ class AlgoListPanel(QWidget):
                                              int(parts[1]))
         item.setData(INSTANCE_KEY_ROLE, instance_key)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        # Standard: aktiviert (Overlay sichtbar).
-        item.setCheckState(Qt.Checked)
+        # Standard: aktiviert (Overlay sichtbar) – siehe `checked`.
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self._updating = True
         try:
             self.list_widget.addItem(item)
