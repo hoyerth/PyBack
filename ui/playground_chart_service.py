@@ -151,7 +151,15 @@ class PlaygroundChartService:
             full_html=False, include_plotlyjs=False, config=_PLOTLY_CONFIG)
         return f"""<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title></head>
+<head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title>
+<style>
+    /* Hoehen-Kette html/body -> 100%, damit das plotly-Div (height:100%)
+       den GESAMTEN Canvas ausfuellt statt auf die Default-Hoehe zu fallen
+       (Anwender-Anforderung, 17.08.2026). */
+    html, body {{ height: 100%; margin: 0; padding: 0;
+                  background: #111418; overflow: hidden; }}
+</style>
+</head>
 <body style="{_BODY_STYLE}">
 <script src="{_PLOTLY_JS_URL}"></script>
 {plot_div}
