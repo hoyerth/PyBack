@@ -8,5 +8,5 @@ ui-Paket (PyBack): UI-Fenster & Control-Widgets.
   * algo_list_panel.py     – AlgoListPanel (Checkbox-Liste + "+", Phase 2)
   * algo_picker_dialog.py  – AlgoPickerDialog ("+"-Dialog, Dropdown-Checkliste)
   * param_form_widget.py   – ParamFormWidget (Schema→Widgets, Phase 3)
-  * playground_chart_service.py – Plotly-HTML-Builder (Phase 4)
+  * playground_chart_service.py – Plotly-HTML-Builder (Phase 4: Candlestick)
 """

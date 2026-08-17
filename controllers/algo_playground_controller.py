@@ -5,8 +5,10 @@ controllers/algo_playground_controller.py - Presenter fuer den Algo-Playground.
 Phase 2: Koppelt die UI-Events der Algo-Liste an den AlgoPickerDialog und
 haelt den Zustand (aktive Algos). Phase 3: Parameter-Form – Auswahl eines
 Listeneintrags befuellt die ParamFormWidget aus dessen parameter_schema;
-Aenderungen werden pro Instanz (instance_key) gespeichert. Die restliche
-Logik (Daten-Slicing, Berechnung, Canvas-Update, Debounce) folgt in Phase 6.
+Aenderungen werden pro Instanz (instance_key) gespeichert. Phase 4: Canvas-
+Basics – Daten-Cache (Konzept 2.4: einmalig pro Symbol/TF aus dem
+MarketDataRepository laden), Zeitraum-Slice (client-seitig) und Candlestick-
+Render in den QWebEngineView. Phase 6 erweitert: Overlays, Debounce, Worker.
 
 Verantwortlich (SRP/IoC):
   * Registry einmalig laden (AlgoRegistry.discover_algos)
@@ -15,18 +17,22 @@ Verantwortlich (SRP/IoC):
   * params_changed -> pro Instanz speichern (Phase 6: Debounce + Neuberechnung)
   * Kontextmenue "Entfernen" -> aktiven Zustand nachfuehren
   * Checkbox -> Signal (Phase 6 konsumiert: Overlay ein/aus)
+  * Symbol/TF-Wechsel + Zeitraum -> Daten laden (Cache) + Canvas rendern
 
 Der Controller kennt main_win NICHT als Modul – er erhaelt das View-Objekt
 (duck-typed) ueber den Konstruktor.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
+from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
+from ui.playground_chart_service import PlaygroundChartService
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
@@ -34,7 +40,10 @@ PLAYGROUND_STATE_KEY = "playground_state"
 
 
 class AlgoPlaygroundController(QObject):
-    """Presenter des Algo-Playgrounds (Phase 2 + 3: Liste, Dialog, Params)."""
+    """Presenter des Algo-Playgrounds (Phase 2-4: Liste, Dialog, Params, Canvas)."""
+
+    # Maximale Kerzenzahl beim einmaligen Laden aus DuckDB (Konzept 2.4).
+    CANDLE_LIMIT = 5000
 
     def __init__(self, view) -> None:
         super().__init__()
@@ -47,13 +56,23 @@ class AlgoPlaygroundController(QObject):
         # Aktuell in der ParamFormWidget angezeigte Instanz (Phase 3).
         self.selected_instance: Optional[str] = None
 
+        # Phase 4: Daten-Cache (Konzept 2.4) + Chart-Service + Repository.
+        self._candles_cache: Optional[pd.DataFrame] = None
+        self._last_pair: Optional[Tuple[str, str]] = None
+        self._chart_service = PlaygroundChartService()
+        self._data_repo = MarketDataRepository()
+
         self._init_bindings()
 
     # ------------------------------------------------------------------
     # Bindings
     # ------------------------------------------------------------------
     def _init_bindings(self) -> None:
-        """Verbindet die Signale des Views mit diesem Controller."""
+        """Verbindet die Signale des Views mit diesem Controller.
+
+        Defensiv (getattr): FakeViews in Tests duerfen Teilbereiche weglassen
+        (z. B. keine symbol_combo/canvas) – die restlichen Bindings greifen.
+        """
         self.ui.algo_panel.algo_add_requested.connect(self._on_add_requested)
         self.ui.algo_panel.algo_removed.connect(self._on_algo_removed)
         # Checkbox: in Phase 6 konsumiert (Overlay ein/aus) – hier nur Status.
@@ -61,6 +80,16 @@ class AlgoPlaygroundController(QObject):
         self.ui.algo_panel.algo_selected.connect(self._on_algo_selected)
         # Parameter-Aenderungen (Phase 3): pro Instanz speichern.
         self.ui.param_form.params_changed.connect(self._on_params_changed)
+
+        # Phase 4: Symbol/TF-Wechsel -> Cache neu laden + rendern.
+        for attr in ("symbol_combo", "tf_combo"):
+            combo = getattr(self.ui, attr, None)
+            if combo is not None:
+                combo.currentTextChanged.connect(self._on_symbol_tf_changed)
+        # Phase 4: Zeitraum-Aenderung -> nur Slicen + rendern (kein Neuladen).
+        tr = getattr(self.ui, "time_range", None)
+        if tr is not None:
+            tr.range_changed.connect(self._on_range_changed)
 
     # ------------------------------------------------------------------
     # Events
@@ -226,6 +255,69 @@ class AlgoPlaygroundController(QObject):
                         [int(sizes[0]), int(sizes[1])])
                 except (TypeError, ValueError):
                     pass
+
+    # ------------------------------------------------------------------
+    # Canvas (Phase 4: Candlestick + Zeitraum-Slice, Konzept 2.4)
+    # ------------------------------------------------------------------
+    def refresh_chart(self) -> None:
+        """Laedt (falls noetig) die Daten und rendert den Canvas neu.
+
+        Wird vom View beim Start (nach restore_state) und nach einem
+        erfolgreichen Sync aufgerufen. Symbol/TF-Wechsel invalidiert den
+        Cache (Konzept 2.4: einmaliges Laden pro (Symbol, TF)-Paar).
+        """
+        self._load_candles()
+        self._render_chart()
+
+    def _load_candles(self) -> None:
+        """Laedt OHLCV-Kerzen einmalig pro (Symbol, TF) in den Cache.
+
+        Konzept 2.4: Beim Wechsel von Symbol oder TF wird der DataFrame
+        einmalig aus dem MarketDataRepository geladen und gecacht; danach
+        arbeiten alle Playground-Berechnungen auf diesem Cache (kein
+        Neuladen bei Zeitraum-Aenderungen).
+        """
+        if not hasattr(self.ui, "current_symbol") or \
+                not hasattr(self.ui, "current_timeframe"):
+            return
+        symbol = self.ui.current_symbol()
+        timeframe = self.ui.current_timeframe()
+        pair = (symbol, timeframe)
+        if self._last_pair == pair and self._candles_cache is not None:
+            return  # Cache fuer dieses Paar ist noch gueltig
+
+        self._last_pair = pair
+        candles, _ = self._data_repo.fetch_historical_candles(
+            symbol, timeframe, limit=self.CANDLE_LIMIT)
+        if candles:
+            self._candles_cache = pd.DataFrame(candles)
+        else:
+            # Keine Daten (noch) vorhanden -> leerer Zustand.
+            self._candles_cache = None
+        self.ui.status_label.setText(
+            f"Status: {len(candles)} Kerzen geladen ({symbol} {timeframe})")
+
+    def _on_symbol_tf_changed(self, *_args) -> None:
+        """Symbol oder Timeframe geaendert: Cache invalidieren + neu rendern."""
+        self._last_pair = None  # Cache fuer das alte Paar verwerfen
+        self.refresh_chart()
+
+    def _on_range_changed(self, *_args) -> None:
+        """Zeitraum geaendert: nur Slicen + rendern (Cache bleibt)."""
+        self._render_chart()
+
+    def _render_chart(self) -> None:
+        """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View."""
+        canvas = getattr(self.ui, "canvas", None)
+        if canvas is None:
+            return  # kein Canvas (z.B. Tests mit FakeView)
+
+        symbol = getattr(self.ui, "current_symbol", lambda: "?")()
+        timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
+        from_epoch, to_epoch = self.ui.time_range.get_range()
+        html = self._chart_service.build_candlestick_html(
+            self._candles_cache, from_epoch, to_epoch, symbol, timeframe)
+        canvas.setHtml(html)
 
     # ------------------------------------------------------------------
     # Interne Helfer

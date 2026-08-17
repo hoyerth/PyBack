@@ -25,10 +25,10 @@ from typing import List
 
 from PySide6.QtCore import QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QFontMetrics
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -121,6 +121,9 @@ class MainWin(QMainWindow):
         # Splitter-Positionen. Nach der Fenster-Geometrie, damit die
         # Splitter-Sizes nicht durch das Resize ueberschrieben werden.
         self.playground_controller.restore_state()
+
+        # Canvas initial laden (Phase 4): Daten-Cache + Candlestick-Render.
+        self.playground_controller.refresh_chart()
 
         # Gespeicherte Sub-Fenster (PropertiesWindow etc.) wiederherstellen.
         QTimer.singleShot(200, self.window_manager.restore_all_windows)
@@ -224,15 +227,18 @@ class MainWin(QMainWindow):
         left_layout.addWidget(self.left_splitter, 1)
         left_panel.setLayout(left_layout)
 
-        # -- Rechter Bereich: Canvas-Platzhalter (Phase 4: QWebEngineView) --
-        self.canvas_placeholder = QFrame()
-        self.canvas_placeholder.setFrameShape(QFrame.StyledPanel)
-        self.canvas_placeholder.setMinimumHeight(200)
+        # -- Rechter Bereich: Canvas (Phase 4: QWebEngineView + Plotly-HTML) -
+        self.canvas = QWebEngineView()
+        self.canvas.setMinimumHeight(200)
+        self.canvas.setHtml(
+            "<html><body style='background:#111418'>"
+            "<div style='color:#8a939c;font-family:sans-serif;padding:24px'>"
+            "Canvas initialisiere ...</div></body></html>")
 
         # -- Splitter (verschiebbar, Anwender-Entscheidung 1) --------------
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(left_panel)
-        self.splitter.addWidget(self.canvas_placeholder)
+        self.splitter.addWidget(self.canvas)
         self.splitter.setSizes([280, 820])  # Initiale Groessen
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -371,6 +377,8 @@ class MainWin(QMainWindow):
         self.log.appendPlainText(
             f">>> Sync abgeschlossen. Aktualisierte Paare: {count}"
         )
+        # Neue Daten koennen den Canvas fuellen (Phase 4): Cache neu laden.
+        self.playground_controller.refresh_chart()
 
     # ------------------------------------------------------------------
     def _on_worker_finished(self) -> None:
