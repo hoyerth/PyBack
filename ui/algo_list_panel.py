@@ -25,6 +25,7 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -65,10 +66,17 @@ class AlgoListPanel(QWidget):
         self.add_button.setToolTip("Algo aus allen verfuegbaren hinzufuegen")
         self.add_button.clicked.connect(self.algo_add_requested)
 
+        # "+" oben an Stelle des Labels (Anwender-Anforderung: Label entfaellt).
+        # add_layout = oeffentliche Top-Zeile: main_win fuegt rechts daneben
+        # die Statuszeile ein (Bugfix, kleiner Abstand).
+        self.add_layout = QHBoxLayout()
+        self.add_layout.setContentsMargins(0, 0, 0, 0)
+        self.add_layout.addWidget(self.add_button)
+        self.add_layout.addStretch(1)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        # "+" oben an Stelle des Labels (Anwender-Anforderung: Label entfaellt).
-        layout.addWidget(self.add_button, 0, Qt.AlignLeft)
+        layout.addLayout(self.add_layout)
         layout.addWidget(self.list_widget, 1)
         self.setLayout(layout)
 

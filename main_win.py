@@ -190,6 +190,10 @@ class MainWin(QMainWindow):
         # Beide Panes scrollen bei Platzmangel: QListWidget (Algo-Liste)
         # und QScrollArea (ParamFormWidget) haben eingebaute Scrollbars.
         self.algo_panel = AlgoListPanel()
+        # Statuszeile rechts neben dem "+"-Button (kleiner Abstand).
+        # add_layout = [0] '+' [1] Stretch -> [1] Spacing, [2] Status.
+        self.algo_panel.add_layout.insertSpacing(1, 8)
+        self.algo_panel.add_layout.insertWidget(2, self.status_label, 1)
         self.param_form = ParamFormWidget()
 
         algo_pane = QWidget()
@@ -245,7 +249,6 @@ class MainWin(QMainWindow):
         layout.addLayout(top_row)
         layout.addWidget(self.time_range)
         layout.addWidget(self.splitter, 1)  # dehnt sich aus
-        layout.addWidget(self.status_label)
         layout.addWidget(self.log)
 
         central = QWidget()
