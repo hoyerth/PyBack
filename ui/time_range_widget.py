@@ -87,8 +87,16 @@ class TimeRangeWidget(QWidget):
         self.setLayout(layout)
 
         # -- Signal-Verbindungen -------------------------------------------
+        # Bugfix 17.08.2026 (Datumsfelder): zusaetzlich zu dateTimeChanged
+        # wird editingFinished abgegriffen (Feuer-/Verlass-Enter), damit
+        # manuell getippte Datumswerte IMMER den Chart neu rendern – die
+        # _emit_range-Dedup verhindert dabei Doppel-Emissionen.
         self.date_from.dateTimeChanged.connect(self._on_manual_change)
         self.date_to.dateTimeChanged.connect(self._on_manual_change)
+        self.date_from.editingFinished.connect(self._on_manual_change)
+        self.date_to.editingFinished.connect(self._on_manual_change)
+        # Zuletzt emittierter Bereich (Dedup gegen Doppel-Emissionen).
+        self._last_emitted: Optional[tuple] = None
 
         # Initialer Bereich: letzte 30 Tage (Standard "1M").
         now = datetime.utcnow()
@@ -147,6 +155,12 @@ class TimeRangeWidget(QWidget):
 
     def _emit_range(self) -> None:
         f_epoch, t_epoch = self.get_range()
+        # Dedup (Bugfix 17.08.2026): dateTimeChanged + editingFinished
+        # feuern dicht hintereinander – nur bei tatsaechlich geaendertem
+        # Bereich wird range_changed emittiert (kein Doppel-Render).
+        if (f_epoch, t_epoch) == self._last_emitted:
+            return
+        self._last_emitted = (f_epoch, t_epoch)
         self.range_changed.emit(f_epoch, t_epoch)
 
 

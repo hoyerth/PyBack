@@ -40,7 +40,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from PySide6.QtCore import QEventLoop, QObject, QTimer, QUrl
+from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
@@ -142,6 +142,12 @@ class AlgoPlaygroundController(QObject):
         # Phase 4: Daten-Cache (Konzept 2.4) + Chart-Service + Repository.
         self._candles_cache: Optional[pd.DataFrame] = None
         self._last_pair: Optional[Tuple[str, str]] = None
+        # Bugfix 17.08.2026 (Datums-Persistenz): Max-Epoch des KACHES VOR dem
+        # letzten (force-)Reload. _extend_range_to_latest erweitert das Bis-
+        # Datum NUR, wenn der Anwender vorher schon am Datumsrand war – ein
+        # bewusst gewaehlter (aelt.) Zeitraum wird durch den Sync nicht mehr
+        # ueberschrieben (Restore von Datumseinstellungen bleibt erhalten).
+        self._last_cache_max: Optional[int] = None
         self._chart_service = PlaygroundChartService()
         self._data_repo = MarketDataRepository()
 
@@ -339,6 +345,10 @@ class AlgoPlaygroundController(QObject):
             "params": {key: dict(params)
                        for key, params in self.instance_params.items()},
             "selected_instance": self.selected_instance,
+            # Bugfix 17.08.2026 (Symbol/TF-Persistenz): Symbol und Timeframe
+            # werden mitgespeichert und beim Neustart wiederhergestellt.
+            "symbol": getattr(self.ui, "current_symbol", lambda: None)(),
+            "timeframe": getattr(self.ui, "current_timeframe", lambda: None)(),
             "time_range": [int(from_epoch), int(to_epoch)],
             "splitter_main": [int(x) for x in self.ui.splitter.sizes()],
             "splitter_left": [int(x) for x in self.ui.left_splitter.sizes()],
@@ -360,6 +370,31 @@ class AlgoPlaygroundController(QObject):
         data = sm.get_global_value(PLAYGROUND_STATE_KEY)
         if not isinstance(data, dict):
             return
+
+        # -- Symbol + Timeframe (Bugfix 17.08.2026) ----------------------
+        # Signal-blockiert setzen: der folgende refresh_chart() (main_win)
+        # laedt dann das restaurierte Paar – ein vorzeitiges refresh_chart
+        # pro Combo-Change (jeweils alter Zustand) entfaellt.
+        symbol = data.get("symbol")
+        if isinstance(symbol, str) and hasattr(self.ui, "symbol_combo"):
+            combo = self.ui.symbol_combo
+            combo.blockSignals(True)
+            try:
+                if combo.findText(symbol) < 0:
+                    combo.addItem(symbol)
+                combo.setCurrentText(symbol)
+            finally:
+                combo.blockSignals(False)
+        timeframe = data.get("timeframe")
+        if isinstance(timeframe, str) and hasattr(self.ui, "tf_combo"):
+            combo = self.ui.tf_combo
+            combo.blockSignals(True)
+            try:
+                if combo.findText(timeframe) < 0:
+                    combo.addItem(timeframe)
+                combo.setCurrentText(timeframe)
+            finally:
+                combo.blockSignals(False)
 
         # -- Zeitraum ----------------------------------------------------
         tr = data.get("time_range")
@@ -474,6 +509,14 @@ class AlgoPlaygroundController(QObject):
                 self._candles_cache is not None:
             return  # Cache fuer dieses Paar ist noch gueltig
 
+        # Bugfix 17.08.2026 (Datums-Persistenz): Max-Epoch des ALTEN Caches
+        # merken, damit _extend_range_to_latest den Anwender-Zeitraum nicht
+        # ungewollt ueberschreibt (nur am Datumsrand erweitern).
+        if self._candles_cache is not None and not self._candles_cache.empty:
+            self._last_cache_max = int(self._candles_cache["time"].max())
+        else:
+            self._last_cache_max = None
+
         self._last_pair = pair
         candles, _ = self._data_repo.fetch_historical_candles(
             symbol, timeframe, limit=self.CANDLE_LIMIT)
@@ -489,14 +532,23 @@ class AlgoPlaygroundController(QObject):
         """Erweitert das Bis-Datum auf die neueste Kerze (nach Sync).
 
         Nur wenn die neueste gecachte Kerze neuer als das aktuelle Bis-Datum
-        ist. Von/Bis setzen emittiert range_changed -> _on_range_changed
-        rendert den Canvas einmal neu (keine Schleife).
+        ist UND der Anwender vorher schon am Datumsrand war (Bis >= Max des
+        vorherigen Caches). Sonst bleibt ein bewusst gewaehlter (aelt.)
+        Zeitraum unangetastet – restaurierte Datumseinstellungen werden
+        durch den Startup-Sync nicht mehr ueberschrieben (Bugfix
+        17.08.2026). Von/Bis setzen emittiert range_changed ->
+        _on_range_changed rendert den Canvas einmal neu (keine Schleife).
         """
         if self._candles_cache is None or self._candles_cache.empty:
             return
         max_epoch = int(self._candles_cache["time"].max())
         _, to_epoch = self.ui.time_range.get_range()
-        if max_epoch > to_epoch:
+        if max_epoch <= to_epoch:
+            return
+        # Nur erweitern, wenn der Anwender vorher am Datumsrand war. Nach
+        # einem Restore/Neustart ist _last_cache_max None (frischer Cache) ->
+        # der restaurierte Zeitraum bleibt exakt erhalten.
+        if self._last_cache_max is not None and to_epoch >= self._last_cache_max:
             from datetime import datetime
             from_epoch, _ = self.ui.time_range.get_range()
             self.ui.time_range.set_range(
@@ -581,51 +633,39 @@ class AlgoPlaygroundController(QObject):
     # Phase 6: Plotly-View (Zoom/Skala) lesen + Overlays inkrementell
     # ------------------------------------------------------------------
     def _poll_view(self) -> None:
-        """Timer: liest den aktuellen Plotly-View und cached ihn in _last_view.
+        """Timer: liest den aktuellen Plotly-View ASYNCHRON (kein Blocking).
 
         Wird periodisch (2s) und nach jedem Render (singleShot 500ms)
-        ausgefuehrt. save_state nutzt dann nur noch den Cache – kein JS
-        beim Schliessen.
+        ausgefuehrt. runJavaScript ist asynchron – das Ergebnis kommt als
+        Queued-Callback im UI-Thread an (_on_view_read) und wird in
+        _last_view gecacht. Kein QEventLoop/kein nested exec mehr
+        (Bugfix 17.08.2026): der fruehere synchrone QEventLoop blockierte
+        bis zu 800ms alle 2s die UI und vertrug sich schlecht mit
+        QWebEngineView + QDateTimeEdit-Popups (Datumsfelder wirkten tot).
         """
-        view = self._capture_view()
-        if view is not None:
-            self._last_view = view
+        self._request_view_read()
 
-    def _capture_view(self) -> Optional[dict]:
-        """Liest den aktuellen Plotly-View (x/y-Range) synchron aus dem Canvas.
-
-        runJavaScript ist asynchron -> QEventLoop + Timeout (800ms). Ohne
-        Canvas/Page oder ohne gerendertes Plot -> None (Tests, leerer Canvas).
-        """
+    def _request_view_read(self) -> None:
+        """Startet das asynchrone Lesen des Plotly-Views (nicht blockierend)."""
         canvas = getattr(self.ui, "canvas", None)
         page = getattr(canvas, "page", None)
         if page is None or not callable(page):
-            return None  # z. B. CanvasStub in Tests
+            return  # z. B. CanvasStub in Tests
         try:
             qpage = page()
         except Exception:
-            return None
+            return
         if qpage is None:
-            return None
-
-        result: Dict[str, Any] = {"view": None}
-        loop = QEventLoop()
+            return
         try:
-            def _cb(value: Any) -> None:
-                result["view"] = value
-                loop.quit()
-
-            qpage.runJavaScript(_JS_READ_VIEW, _cb)
-            # Sicherheits-Timeout (z. B. Seite noch am Laden).
-            QTimer.singleShot(800, loop.quit)
-            loop.exec()
+            qpage.runJavaScript(_JS_READ_VIEW, self._on_view_read)
         except Exception as exc:
-            print(f"WARN [Playground] View-Lesen fehlgeschlagen: {exc}")
-            return None
-        view = result["view"]
-        if isinstance(view, dict) and (view.get("xrange") or view.get("yrange")):
-            return view
-        return None
+            print(f"WARN [Playground] View-Read fehlgeschlagen: {exc}")
+
+    def _on_view_read(self, value: Any) -> None:
+        """Callback von _request_view_read: gueltigen View in _last_view cachen."""
+        if isinstance(value, dict) and (value.get("xrange") or value.get("yrange")):
+            self._last_view = value
 
     # ------------------------------------------------------------------
     # Phase 6: Inkrementelle Overlay-Aenderungen (USER-REQ, kein Neuaufbau)
