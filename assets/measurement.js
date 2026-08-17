@@ -195,13 +195,21 @@ var Measurement = (function() {
 
         var pts = null;
         if (dragging && draft) {
+            // Draft = Client-Pixel (Mausposition) – Box bleibt an der Maus.
             pts = { x1: draft.x1, y1: draft.y1, x2: draft.x2, y2: draft.y2 };
         } else if (state) {
+            // Bugfix 17.08.2026 (Messbox springt beim Loslassen): _toPixel
+            // liefert Plot-Area-relativ (l2p ab Achsenstart). Fuer konsistente
+            // Client-Koordinaten muessen die Achsen-Offsets addiert werden –
+            // sonst springt die Box um (xax._offset, yax._offset) nach oben
+            // links, sobald aus dem Draft der State gerendert wird.
             var p1 = _toPixel(state.from.ms, state.from.price);
             var p2 = _toPixel(state.to.ms, state.to.price);
             var rect0 = a.gd.getBoundingClientRect() || { left: 0, top: 0 };
-            pts = { x1: (rect0.left || 0) + p1.x, y1: (rect0.top || 0) + p1.y,
-                    x2: (rect0.left || 0) + p2.x, y2: (rect0.top || 0) + p2.y };
+            pts = { x1: (rect0.left || 0) + p1.x + (a.xax._offset || 0),
+                    y1: (rect0.top || 0) + p1.y + (a.yax._offset || 0),
+                    x2: (rect0.left || 0) + p2.x + (a.xax._offset || 0),
+                    y2: (rect0.top || 0) + p2.y + (a.yax._offset || 0) };
         }
         if (!pts) { _hide(region); _hide(box); return; }
 
