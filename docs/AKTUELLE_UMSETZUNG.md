@@ -137,3 +137,34 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 
 * `.venv\Scripts\python.exe -m py_compile controllers/algo_playground_controller.py` OK.
 * Bestehende headless-Validatoren decken den SMA-Pfad ab: `test/check_sma_visibility.py`, `test/check_visibility_apppath.py`, `test/check_controller_render.py`, `test/check_overlay_regression.py`, `test/check_shell_selfheal.py`.
+
+---
+
+## Implementierungs-Log: Mess-Tool im Playground (17.08.2026)
+
+> **USER-REQ:** Mess-Tool aus PyTrader wirtschaftlich uebernehmen (oder neu bauen) und in den Playground einbauen; Aktivierung per **Shift + Rechtsklick-Maus**.
+
+### Entscheidung (Frage 1): Uebernehmen & anpassen, nicht neu bauen
+
+* 1:1-Kopie aus PyTrader ist NICHT moeglich: PyTrader nutzt **Lightweight Charts v5** (`candleSeries.coordinateToPrice`, `timeScale.coordinateToLogical`), PyBack nutzt **Plotly 3.x** (`#pg-chart`, `gd._fullLayout.xaxis`). Die Koordinaten-/Event-APIs sind fundamental verschieden.
+* Uebernommen (library-agnostisch, ~60 %): Mess-Zustandsmodell, CSS-Overlay-Design (`#measurement-region`/`#measurement-box`), Live-Messtext (Δ Preis % + absolut, Δ Zeit Bars + DD:HH:MM, Start/Ende), `formatDuration`, `formatMeasurementText`, Escape/normaler-Klick-loescht, temporaere Anzeige.
+* Neu adaptiert (Plotly): Koordinaten via `xaxis.p2l/l2p` + `yaxis.p2l/l2p` (Plotly linearisiert Datumsachsen als UTC-ms → **Wanduhr-Korrektur** via `getTimezoneOffset`, da die X-Achse Wanduhr-ISO-Strings zeigt – kein Berlin-Offset, Projekt-Konvention); Trigger **Shift + rechte Maustaste** (`e.shiftKey && e.button === 2`, Kontextmenue wird bei Shift unterdrueckt); Bars-Zaehlung per Binary-Search (`fracIndexAtMs`) ueber die sichtbaren Candles; Nachkommastellen automatisch aus den Close-Werten.
+
+### Aenderungen
+
+| Datei | Inhalt |
+|-------|--------|
+| `assets/measurement.js` | **Neu:** Selbstenthaltenes Mess-Modul (IIFE, Plotly-Adaption, pure Funktionen testbar). |
+| `ui/playground_chart_service.py` | `_MEASURE_JS_URL` (Datei-Referenz wie plotly.min.js), CSS fuer `#pg-wrap`/`#measurement-region`/`#measurement-box`, Page-Shell wrappt `#pg-chart` in `#pg-wrap` + Overlay-Divs, laedt `measurement.js` und ruft `Measurement.init()` nach dem ersten Render. |
+| `test/check_measurement.py` | **Neu (lokal, gitignored):** Headless-End-to-End (echte SILVER-M1-Kerzen, jsdom, echte plotly.min.js + measurement.js inline) – simuliert Shift+Rechts-Drag und prueft Messbox + Escape-Clear. |
+
+### Bedienung
+
+* **Shift + rechte Maustaste ziehen:** Messbox mit Live-Werten (Δ Preis in % + absolut, Δ Zeit in Bars + DD:HH:MM, Start/Ende mit Wanduhr-Zeit).
+* **Linker Klick oder Escape:** Messung entfernen.
+* Die Box folgt Zoom/Pan/react automatisch (`plotly_afterplot`/`plotly_relayout` → `updatePositions`, Datenkoordinaten-basiert).
+
+### Verifikation (headless, keine UI)
+
+* `test/check_measurement.py` – **OK**: Messbox sichtbar, Messtext vollstaendig (`Δ Preis: -4.43% (-3.047)`, `Δ Zeit: 317 Bars · 10:13:00`, Start/Ende korrekt), Escape-Clear funktioniert.
+* `py_compile ui/playground_chart_service.py` OK.

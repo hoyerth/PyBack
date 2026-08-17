@@ -34,6 +34,14 @@ _PLOTLY_JS_ABS = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), _PLOTLY_JS_REL))
 _PLOTLY_JS_URL = _PLOTLY_JS_ABS.replace("\\", "/")
 
+# USER-REQ (17.08.2026): Mess-Tool (aus PyTrader uebernommen, Plotly-Adaption,
+# Aktivierung Shift+Rechtsklick) – assets/measurement.js als LOKALE Datei
+# referenziert (wie plotly.min.js), damit die Page-Shell klein bleibt.
+_MEASURE_JS_REL = os.path.join("..", "assets", "measurement.js")
+_MEASURE_JS_ABS = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), _MEASURE_JS_REL))
+_MEASURE_JS_URL = _MEASURE_JS_ABS.replace("\\", "/")
+
 # Plotly-Config fuer TradingView/MT5-aehnliches Verhalten im Canvas
 # (Anwender-Anforderung, 17.08.2026):
 #   * scrollZoom=True      - Mausrad zoomt direkt an der Cursor-Position
@@ -356,18 +364,48 @@ class PlaygroundChartService:
        (Anwender-Anforderung, 17.08.2026). */
     html, body {{ height: 100%; margin: 0; padding: 0;
                   background: #111418; overflow: hidden; }}
+    /* USER-REQ (17.08.2026): Mess-Tool-Overlays – Messbox als reines
+       CSS-Overlay (wie PyTrader), robust gegen Plotly.react (Geschwister
+       der pg-chart-Div in #pg-wrap, pointer-events:none). */
+    #pg-wrap {{ position: relative; width: 100%; height: 100%; }}
     #{_CHART_DIV_ID} {{ width: 100%; height: 100%; }}
+    #measurement-region {{
+        display: none; position: absolute;
+        background: rgba(41, 98, 255, 0.15);
+        border: 1px dashed #2962FF;
+        pointer-events: none; z-index: 10;
+    }}
+    #measurement-box {{
+        display: none; position: absolute;
+        background: rgba(17, 20, 24, 0.92);
+        border: 1px solid #2962FF; color: #d8d8d8;
+        font-family: Consolas, 'Courier New', monospace;
+        font-size: 12px; padding: 6px 8px; border-radius: 4px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+        pointer-events: none; z-index: 11;
+        white-space: pre; line-height: 1.4;
+    }}
 </style>
 </head>
 <body style="{_BODY_STYLE}">
 <script src="{_PLOTLY_JS_URL}"></script>
-<div id="{_CHART_DIV_ID}"></div>
+<div id="pg-wrap">
+    <div id="{_CHART_DIV_ID}"></div>
+    <div id="measurement-region"></div>
+    <div id="measurement-box"></div>
+</div>
 <script>
 (function(){{
   var gd = document.getElementById('{_CHART_DIV_ID}');
   if (!gd || typeof Plotly === 'undefined') return;
   var fig = {safe_json};
   Plotly.react(gd, fig.data, fig.layout, fig.config);
+}})();
+</script>
+<script src="{_MEASURE_JS_URL}"></script>
+<script>
+(function(){{
+  if (window.Measurement) {{ window.Measurement.init(); }}
 }})();
 </script>
 </body>
