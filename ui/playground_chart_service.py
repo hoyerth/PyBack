@@ -21,7 +21,6 @@ standalone Plotly-HTML mit Candlestick + Dark-Theme und Zeitraum-Slice.
 Nur Build-Logik (SRP): KEIN Qt-Import, KEIN DuckDB-Zugriff.
 """
 
-import json
 import os
 from typing import Optional
 
@@ -53,15 +52,6 @@ _PLOTLY_CONFIG = {
 # Dunkler Body-Hintergrund passend zum plotly_dark-Template (#111418 ist die
 # plotly_dark-Paper-Farbe, damit der Canvas nahtlos dunkel wirkt).
 _BODY_STYLE = "margin:0;padding:0;background:#111418;overflow:hidden"
-
-# Marker des eingebetteten View-Restore-Skripts (Phase 6). Der Controller
-# prueft nach build_candlestick_html, ob der gespeicherte Plotly-View
-# tatsaechlich eingebettet wurde: Leere Render (keine Kerzen im Zeitraum ->
-# _EMPTY_HTML ohne Skript) enthalten den Marker NICHT – dann bleibt der
-# _pending_view fuer den naechsten Render mit Daten erhalten (Bugfix
-# 17.08.2026: set_range vor dem ersten Daten-Render verwirft den Restore-
-# View nicht mehr).
-VIEW_SCRIPT_MARKER = "Plotly.relayout"
 
 # Automatischer Farbzyklus fuer Algo-Overlays (Phase 5.3: erstmal automatisch;
 # spaeter je Algo einstellbar). Helle, auf Dark-Theme gut lesbare Farben.
@@ -120,9 +110,11 @@ class PlaygroundChartService:
                  "y": pd.Series/Liste, "color": str} – wird als Liniengrafik
                 ueber die Candles gelegt (Phase 5).
             initial_view: Optional. Gespeicherter Plotly-View
-                {"xrange": [iso, iso], "yrange": [float, float]} – wird
-                NACH dem Plotly-Render eingebettet angewendet (Phase 6,
-                Restore von Zoom/Skala beim Neustart).
+                {"xrange": [wallclock-iso, wallclock-iso], "yrange": [float,
+                float]} – wird DIREKT als Achsen-Range in die Plotly-Figur
+                eingebettet (Phase 6, Restore von Zoom/Skala). Ohne View ist
+                die X-Achse exakt [from_epoch, to_epoch] (Datumsfelder sind
+                massgebend fuer die Skala, Bugfix 17.08.2026).
 
         Returns:
             Standalone-HTML-String (plotly.js offline als Datei referenziert).
@@ -202,15 +194,29 @@ class PlaygroundChartService:
             if breaks:
                 fig.update_xaxes(rangebreaks=breaks)
 
+        # Bugfix 17.08.2026 (Datumsfelder setzen die Skala): Die X-Achse wird
+        # EXPLIZIT gesetzt – entweder auf den gespeicherten View (Restore/
+        # Zoom-Kontinuitaet) oder, wenn kein View vorliegt, exakt auf den
+        # eingestellten Zeitraum [from_epoch, to_epoch]. Damit ist der
+        # Zeitraum-Picker massgebend fuer die sichtbare Skala (kein stilles
+        # Autorange, das einen Datums-Wechsel optisch ignorieren kann). Die
+        # Wanduhr-naiven "YYYY-MM-DDTHH:MM:SS"-Strings entsprechen exakt dem
+        # Kerzen-x-Format (plotly parst beide als lokale Zeit -> konsistent).
+        view = initial_view if isinstance(initial_view, dict) else None
+        if view and view.get("xrange"):
+            fig.update_xaxes(range=[view["xrange"][0], view["xrange"][1]])
+        else:
+            fig.update_xaxes(range=[
+                pd.to_datetime(int(from_epoch), unit="s").strftime(
+                    "%Y-%m-%dT%H:%M:%S"),
+                pd.to_datetime(int(to_epoch), unit="s").strftime(
+                    "%Y-%m-%dT%H:%M:%S"),
+            ])
+        if view and view.get("yrange"):
+            fig.update_yaxes(range=[view["yrange"][0], view["yrange"][1]])
+
         plot_div = fig.to_html(
             full_html=False, include_plotlyjs=False, config=_PLOTLY_CONFIG)
-        # Phase 6: gespeicherten View (Zoom/Skala) eingebettet anwenden –
-        # laeuft NACH dem Plotly-Render in derselben Seite (zuverlaessig,
-        # kein runJavaScript-Race nach setHtml).
-        view_script = ""
-        if isinstance(initial_view, dict) and (
-                initial_view.get("xrange") or initial_view.get("yrange")):
-            view_script = PlaygroundChartService._build_view_script(initial_view)
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title>
@@ -225,47 +231,12 @@ class PlaygroundChartService:
 <body style="{_BODY_STYLE}">
 <script src="{_PLOTLY_JS_URL}"></script>
 {plot_div}
-{view_script}
 </body>
 </html>"""
 
     # ------------------------------------------------------------------
     # Interne Helfer
     # ------------------------------------------------------------------
-    @staticmethod
-    def _build_view_script(view: dict) -> str:
-        """Baut das eingebettete JS-Skript zum Anwenden eines Plotly-Views.
-
-        Pollt (50ms, max. 120 Versuche = 6s), bis die Seite nach dem
-        Plotly-Render bereit ist, und setzt dann per Plotly.relayout den
-        sichtbaren x/y-Ausschnitt (ISO-Strings funktionieren direkt fuer
-        die Datumsachse). Laeuft in der Seite selbst (kein Race mit setHtml).
-        """
-        payload = json.dumps({
-            "xrange": view.get("xrange"),
-            "yrange": view.get("yrange"),
-        })
-        return f"""<script type="text/javascript">
-(function() {{
-  var state = {payload};
-  var tries = 0;
-  var t = setInterval(function() {{
-    tries += 1;
-    var gd = document.querySelector('.plotly-graph-div');
-    if (gd && gd._fullLayout && gd._fullLayout.xaxis &&
-        typeof Plotly !== 'undefined') {{
-      clearInterval(t);
-      var upd = {{}};
-      if (state.xrange) upd['xaxis.range'] = state.xrange;
-      if (state.yrange) upd['yaxis.range'] = state.yrange;
-      if (upd['xaxis.range'] || upd['yaxis.range']) Plotly.relayout(gd, upd);
-    }} else if (tries > 120) {{
-      clearInterval(t);
-    }}
-  }}, 50);
-}})();
-</script>"""
-
     @staticmethod
     def _build_rangebreaks(times) -> list:
         """Erkennt Luecken im Zeitverlauf und baut plotly-rangebreaks.

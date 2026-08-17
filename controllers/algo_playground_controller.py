@@ -37,43 +37,54 @@ Der Controller kennt main_win NICHT als Modul – er erhaelt das View-Objekt
 
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from PySide6.QtCore import QObject, QTimer, QUrl
-from PySide6.QtWidgets import QDialog
+from PySide6.QtWidgets import QApplication, QDialog
 
 from algos.algo_registry import AlgoRegistry
 from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
-from ui.playground_chart_service import (
-    OVERLAY_COLORS,
-    VIEW_SCRIPT_MARKER,
-    PlaygroundChartService,
-)
+from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
 from workers.playground_worker import PlaygroundWorker
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
 PLAYGROUND_STATE_KEY = "playground_state"
 
+# Marker des leeren Canvas-HTML (_EMPTY_HTML in playground_chart_service):
+# ein Render OHNE Kerzen darf den _pending_view nicht konsumieren – der
+# gespeicherte View gilt fuer den naechsten Render MIT Daten (Bugfix
+# 17.08.2026: set_range vor dem ersten Daten-Render verwirft den Restore-
+# View nicht mehr).
+_EMPTY_MARKER = "Keine Daten"
+
 # Phase 6: JS-Snippet zum Auslesen des aktuellen Plotly-Views (Zoom/Skala).
-# Liefert den sichtbaren Ausschnitt aus _fullLayout: xrange (Datumsachse,
-# als ISO-Strings) und yrange (Preisachse, als Zahlen) – exakt das, was
-# Plotly nach einem Zoom/Pan intern haelt. Autorange ist dabei bereits in
-# konkrete Ranges aufgeloest.
+# Liefert den sichtbaren Ausschnitt aus _fullLayout: xrange (Datumsachse)
+# und yrange (Preisachse, als Zahlen) – exakt das, was Plotly nach einem
+# Zoom/Pan intern haelt (Autorange ist dabei bereits in konkrete Ranges
+# aufgeloest). Bugfix 17.08.2026: xrange wird als WANDUHR-naiver
+# "YYYY-MM-DDTHH:MM:SS"-String geliefert (via getFullYear/getMonth/...),
+# damit der gespeicherte View exakt dem Kerzen-x-Format entspricht (plotly
+# parst beide als lokale Zeit) – ein UTC-toISOString wuerde je nach
+# Zeitzone einen Offset zwischen Achse und Kerzen erzeugen.
 _JS_READ_VIEW = """
 (function(){
   var gd = document.querySelector('.plotly-graph-div');
   if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return null;
-  function toISO(v) {
-    return (v && typeof v.toISOString === 'function') ? v.toISOString() : v;
+  function toWallClock(v) {
+    if (!(v instanceof Date)) return v;
+    function p(n){ return (n < 10 ? '0' : '') + n; }
+    return v.getFullYear() + '-' + p(v.getMonth() + 1) + '-' + p(v.getDate()) +
+           'T' + p(v.getHours()) + ':' + p(v.getMinutes()) + ':' + p(v.getSeconds());
   }
   var xr = gd._fullLayout.xaxis.range;
   var yr = gd._fullLayout.yaxis.range;
   return {
-    xrange: (xr && xr.length === 2) ? [toISO(xr[0]), toISO(xr[1])] : null,
-    yrange: (yr && yr.length === 2) ? [toISO(yr[0]), toISO(yr[1])] : null
+    xrange: (xr && xr.length === 2) ? [toWallClock(xr[0]), toWallClock(xr[1])] : null,
+    yrange: (yr && yr.length === 2) ? [toWallClock(yr[0]), toWallClock(yr[1])] : null
   };
 })()
 """
@@ -164,8 +175,10 @@ class AlgoPlaygroundController(QObject):
         # in save_state genutzt, damit beim Schliessen KEIN JS mehr laufen
         # muss (QEventLoop waehrend closeEvent ist unzuverlaessig).
         self._last_view: Optional[dict] = None
+        # Bugfix 17.08.2026 (View-Persistenz): 500ms statt 2s – der Zoom
+        # ist damit max. 0.5s alt, wenn save_state gelesen wird.
         self._view_timer = QTimer(self)
-        self._view_timer.setInterval(2000)
+        self._view_timer.setInterval(500)
         self._view_timer.timeout.connect(self._poll_view)
         self._view_timer.start()
         # Reihenfolge der AKTUELL im Canvas sichtbaren Overlay-Traces
@@ -328,6 +341,20 @@ class AlgoPlaygroundController(QObject):
         und der aktuelle Plotly-View (Zoom/Skala, Phase 6-Ergaenzung).
         Abgelegt unter global_settings/playground_state (StateManager).
         """
+        # Bugfix 17.08.2026 (View-Persistenz): den allerletzten Zoom/eingriff
+        # einfangen, auch wenn der View-Timer ihn noch nicht gecacht hat.
+        # Der begrenzte Event-Pump (max. 300ms) liefert den asynchronen
+        # runJavaScript-Callback, bevor der State geschrieben wird. Kein
+        # QEventLoop/nested exec (blockierte sonst UI + Datumsfelder).
+        if self._request_view_read():
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    break
+                time.sleep(0.005)
+
         panel = self.ui.algo_panel
         checked = panel.checked_states()
         algos = [
@@ -563,10 +590,13 @@ class AlgoPlaygroundController(QObject):
     def _on_range_changed(self, *_args) -> None:
         """Zeitraum geaendert: nur Slicen + rendern (Cache bleibt).
 
-        Der Zeitraum-Picker ist jetzt massgebend -> keinen alten Zoom
-        konservieren (sonst wuerde der Chart zurueck auf den alten
-        Ausschnitt springen).
+        Bugfix 17.08.2026 (Datumsfelder setzen die Skala): Ein noch nicht
+        konsumierter _pending_view (z. B. Restore-View) darf die NEU
+        gewaehlte Zeitraum-Skala nicht ueberschreiben – die Datumsfelder
+        sind massgebend (build_candlestick_html setzt die X-Achse exakt
+        auf [from_epoch, to_epoch]).
         """
+        self._pending_view = None
         self._render_chart(preserve_view=False)
 
     def _render_chart(self, preserve_view: bool = True) -> None:
@@ -604,20 +634,16 @@ class AlgoPlaygroundController(QObject):
         # inkrementelle Aenderungen per JS (Trace-Index = 1 + Position).
         self._overlay_order = [t["key"] for t in overlays]
 
-        # Der gespeicherte View wird direkt ins HTML eingebettet und dort
-        # NACH dem Plotly-Render angewendet – zuverlaessiger als ein
-        # runJavaScript direkt nach setHtml (das liefe auf der alten Seite).
+        # Der gespeicherte View (Zoom/Skala) wird direkt als Achsen-Range in
+        # die Plotly-Figur eingebettet (kein Post-Render-Skript/kein Race).
         html = self._chart_service.build_candlestick_html(
             self._candles_cache, from_epoch, to_epoch, symbol, timeframe,
             overlays=overlays, initial_view=self._pending_view)
-        # Phase 6 (Bugfix 17.08.2026): _pending_view nur konsumieren, wenn
-        # das HTML das View-Restore-Skript tatsaechlich eingebettet hat.
-        # Leere Render (keine Kerzen -> _EMPTY_HTML ohne Skript) duerfen den
-        # Restore-View nicht verwerfen – sonst geht der Zoom verloren, wenn
-        # vor dem ersten Daten-Render z. B. ein set_range (range_changed ->
-        # Render auf leerem Cache) feuert. Der View bleibt dann fuer den
-        # naechsten Render MIT Daten erhalten.
-        if VIEW_SCRIPT_MARKER in html:
+        # Bugfix 17.08.2026: _pending_view nur konsumieren, wenn ein echter
+        # Chart gerendert wurde. Leere Render (keine Kerzen -> _EMPTY_HTML)
+        # duerfen den Restore-View nicht verwerfen – der View gilt fuer den
+        # naechsten Render MIT Daten.
+        if _EMPTY_MARKER not in html:
             self._pending_view = None
 
         assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -645,22 +671,29 @@ class AlgoPlaygroundController(QObject):
         """
         self._request_view_read()
 
-    def _request_view_read(self) -> None:
-        """Startet das asynchrone Lesen des Plotly-Views (nicht blockierend)."""
+    def _request_view_read(self) -> bool:
+        """Startet das asynchrone Lesen des Plotly-Views (nicht blockierend).
+
+        Returns:
+            True, wenn ein Leseversuch gestartet wurde (Canvas+Page da),
+            sonst False (kein Canvas z. B. in Tests/ohne WebEngine).
+        """
         canvas = getattr(self.ui, "canvas", None)
         page = getattr(canvas, "page", None)
         if page is None or not callable(page):
-            return  # z. B. CanvasStub in Tests
+            return False  # z. B. CanvasStub in Tests
         try:
             qpage = page()
         except Exception:
-            return
+            return False
         if qpage is None:
-            return
+            return False
         try:
             qpage.runJavaScript(_JS_READ_VIEW, self._on_view_read)
+            return True
         except Exception as exc:
             print(f"WARN [Playground] View-Read fehlgeschlagen: {exc}")
+            return False
 
     def _on_view_read(self, value: Any) -> None:
         """Callback von _request_view_read: gueltigen View in _last_view cachen."""
