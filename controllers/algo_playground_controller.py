@@ -63,6 +63,18 @@ PLAYGROUND_STATE_KEY = "playground_state"
 # die Konstante bleibt als Referenz auf den Text des Hinweis-HTML erhalten.
 _EMPTY_MARKER = "Keine Daten"
 
+# Bugfix 17.08.2026 (SMA-Overlay-Regression nach P0#1): Seit der Page-Shell
+# rendert Plotly in die feste Div 'pg-chart'. Die von to_html generierte
+# Klasse '.plotly-graph-div' existiert dort NICHT (plotly.js v3.7.0 vergibt
+# diese Klasse nicht auf der Ziel-Div, nur 'js-plotly-plot') – der alte
+# Klassen-Selector liess alle inkrementellen Overlay-JS still ins Leere
+# laufen (gd=null). ALLE Chart-JS-Snippets nutzen daher diesen Ausdruck mit
+# Fallback auf die alte Klasse (Abwaertskompatibilitaet).
+_JS_CHART_DIV = (
+    "document.getElementById('pg-chart')"
+    "||document.querySelector('.plotly-graph-div')"
+)
+
 # Phase 6: JS-Snippet zum Auslesen des aktuellen Plotly-Views (Zoom/Skala).
 # Liefert den sichtbaren Ausschnitt aus _fullLayout: xrange (Datumsachse)
 # und yrange (Preisachse, als Zahlen) – exakt das, was Plotly nach einem
@@ -72,9 +84,9 @@ _EMPTY_MARKER = "Keine Daten"
 # damit der gespeicherte View exakt dem Kerzen-x-Format entspricht (plotly
 # parst beide als lokale Zeit) – ein UTC-toISOString wuerde je nach
 # Zeitzone einen Offset zwischen Achse und Kerzen erzeugen.
-_JS_READ_VIEW = """
+_JS_READ_VIEW_TMPL = """
 (function(){
-  var gd = document.querySelector('.plotly-graph-div');
+  var gd = __CHART_DIV__;
   if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return null;
   function toWallClock(v) {
     if (!(v instanceof Date)) return v;
@@ -90,6 +102,7 @@ _JS_READ_VIEW = """
   };
 })()
 """
+_JS_READ_VIEW = _JS_READ_VIEW_TMPL.replace("__CHART_DIV__", _JS_CHART_DIV)
 
 
 def _epochs_to_iso(epochs) -> List[str]:
@@ -137,7 +150,7 @@ def _js_apply_figure(fig_json: str) -> str:
     rendert nur die Aenderungen (0,5–2s Seiten-Reload -> ~50–150ms).
     """
     return (
-        "(function(){var gd=document.getElementById('pg-chart');"
+        "(function(){var gd=" + _JS_CHART_DIV + ";"
         "if(!gd||typeof Plotly==='undefined')return;"
         "var fig=" + fig_json + ";"
         "Plotly.react(gd,fig.data,fig.layout,fig.config);})()"
@@ -181,7 +194,7 @@ def _js_add_overlay(trace: dict) -> str:
         payload["marker"] = marker
     trace_json = json.dumps(payload)
     return (
-        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "(function(){var gd=" + _JS_CHART_DIV + ";"
         "if(!gd||typeof Plotly==='undefined')return;"
         f"Plotly.addTraces(gd,{trace_json});}})()"
     )
@@ -190,7 +203,7 @@ def _js_add_overlay(trace: dict) -> str:
 def _js_remove_overlay(idx: int) -> str:
     """Baut JS zum Entfernen eines Overlay-Trace per Index (deleteTraces)."""
     return (
-        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "(function(){var gd=" + _JS_CHART_DIV + ";"
         "if(!gd||typeof Plotly==='undefined')return;"
         f"if({idx}<(gd.data||[]).length)Plotly.deleteTraces(gd,{idx});}})()"
     )
@@ -215,7 +228,7 @@ def _js_update_overlay(idx: int, trace: dict) -> str:
         payload["marker"] = marker
     payload_json = json.dumps(payload)
     return (
-        "(function(){var gd=document.querySelector('.plotly-graph-div');"
+        "(function(){var gd=" + _JS_CHART_DIV + ";"
         "if(!gd||typeof Plotly==='undefined')return;"
         f"if({idx}<(gd.data||[]).length)Plotly.restyle(gd,{payload_json},{idx});}})()"
     )
@@ -888,20 +901,27 @@ class AlgoPlaygroundController(QObject):
             base_url)
 
     def _on_canvas_load_finished(self, ok: bool) -> None:
-        """Slot: Page-Shell geladen -> Pending-Figur per Plotly.react anwenden.
+        """Slot: Page-Shell geladen -> Figur frisch per Plotly.react anwenden.
 
         P0#1: Erst wenn die Shell (plotly.min.js + Chart-Div) geladen ist,
         darf per runJavaScript auf Plotly zugegriffen werden. Loads der
         initialen Platzhalter-/Hinweis-Seiten (_shell_set False) werden
         ignoriert.
+
+        Bugfix 17.08.2026 (SMA-Overlay-Regression): Statt nur die beim
+        setHtml eingebettete Pending-Figur erneut per react anzuwenden, wird
+        die Figur FRISCH gebaut und gerendert (_render_chart). Dadurch
+        erscheinen auch Overlays, deren Worker-Ergebnis VOR dem Seiten-Load
+        eintraf und deren addTraces gegen die noch ladende Seite (gd=null)
+        still verloren ging. _render_chart nutzt mit _page_ready=True den
+        react-Pfad -> kein zweiter setHtml, keine Schleife.
         """
         if not self._shell_set:
             return  # kein Shell-Load (z. B. Platzhalter oder _EMPTY_HTML)
         self._page_ready = bool(ok)
         if not self._page_ready:
             return
-        if self._pending_figure_json is not None:
-            self._run_js(_js_apply_figure(self._pending_figure_json))
+        self._render_chart(preserve_view=False)
 
     # ------------------------------------------------------------------
     # Phase 6: Plotly-View (Zoom/Skala) lesen + Overlays inkrementell
