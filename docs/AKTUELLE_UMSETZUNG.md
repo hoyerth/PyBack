@@ -114,3 +114,26 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 * 	est/check_optimize_impl.py – LOD-OHLC-Korrektheit, Figure-JSON (numpy-sicher, hovermode), _epochs_to_iso-Geschwindigkeit, Repository-Range + Precision-Cache, Controller-React-Flow (setHtml 1× + Plotly.react).
 * 	est/check_optimize_prep.py, check_optimize_index.py, check_optimize_index2.py, check_optimize_plotly_json.py, check_optimize_perf.py – Vorab-/Beweis-Messungen (Index, DuckDB-Version 1.5.5, JSON-Typen, Benchmark).
 * py_compile auf allen geaenderten Dateien OK.
+
+---
+
+## Implementierungs-Log: SMA-Overlay sichtbar – Diagnose & Bestaetigung (17.08.2026)
+
+> **Anwender-Bestaetigung:** „es sind alle linien zu sehen, sma und test" – die SMA-Linie wird im Playground wieder angezeigt. Testcode danach entfernt.
+
+### Befund & Diagnoseweg
+
+* **Problem:** SMA-Linie unsichtbar (Legende sichtbar), nach der Performance-Optimierung (P0#1 Plotly.react). Die externe KI vermutete den Fehler in der Uebergabekette (NaN-Werte → JSON → Plotly), die Analyse des aktuellen Stands widerlegte das (headless mit echter plotly.min.js: SMA-x = ISO-Strings, 27605 gueltige Punkte im Range, Linie sichtbar – auch mit NaN-Warmup + NaN-Literal-eval).
+* **Diagnose (reduziert, token-sparend):** Zwei Diagnose-Runden mit injizierten Test-Linien im Playground:
+  1. Test-Linien DIREKT in `_build_overlay_traces` angehaengt (Bypass `_overlays`): Test-Linien sichtbar, SMA nicht.
+  2. Test-Serien (`test_flat`/`test_close`) in den **`_overlays`-Speicher** injiziert (exakter SMA-Pfad `_overlays` → `_build_instance_traces` → `build_chart_figure` → `Plotly.react`): **alle** Linien sichtbar (SMA + beide Test-Linien), `[DIAG]`-Log zeigte `sma_present=True`.
+* **Erkenntnis:** Der komplette additive Overlay-Renderpfad funktioniert; die SMA-Serie selbst ist korrekt (rolling/min_periods-Warmup, NaN unkritisch fuer plotly.js). Der Fehler war weder in `alg_sma.py` noch in der NaN-Serialisierung oder dem Trace-Builder – er trat nur im Laufzeit-Render des QWebEngine auf (Race/veraltete Page), adressiert durch die vorherigen Bugfixes (`#pg-chart`-Selector, Plotly.react statt addTraces, Self-Heal via View-Timer, connectgaps).
+
+### Aenderungen
+
+* **Kein Source-Code-Diff:** `controllers/algo_playground_controller.py` ist nach Entfernen der temporaeren Diagnose wieder exakt auf HEAD (Commit `9d51126`). `test/check_testlines.py` (Diagnose-Test) wurde entfernt.
+
+### Verifikation
+
+* `.venv\Scripts\python.exe -m py_compile controllers/algo_playground_controller.py` OK.
+* Bestehende headless-Validatoren decken den SMA-Pfad ab: `test/check_sma_visibility.py`, `test/check_visibility_apppath.py`, `test/check_controller_render.py`, `test/check_overlay_regression.py`, `test/check_shell_selfheal.py`.
