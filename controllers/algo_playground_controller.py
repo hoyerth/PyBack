@@ -8,7 +8,10 @@ Listeneintrags befuellt die ParamFormWidget aus dessen parameter_schema;
 Aenderungen werden pro Instanz (instance_key) gespeichert. Phase 4: Canvas-
 Basics – Daten-Cache (Konzept 2.4: einmalig pro Symbol/TF aus dem
 MarketDataRepository laden), Zeitraum-Slice (client-seitig) und Candlestick-
-Render in den QWebEngineView. Phase 6 erweitert: Overlays, Debounce, Worker.
+Render in den QWebEngineView. Phase 5: Algo-Overlays – get_overlay_series-
+Hooks werden nach Param- oder Daten-Aenderung (Debounce 300ms) vektorisiert
+berechnet, in app_data.duckdb persistiert (result_schema, store='series')
+und als farbige Linien ueber die Candles gelegt (Checkbox ein/aus).
 
 Verantwortlich (SRP/IoC):
   * Registry einmalig laden (AlgoRegistry.discover_algos)
@@ -27,13 +30,14 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from PySide6.QtCore import QObject, QUrl
+from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtWidgets import QDialog
 
 from algos.algo_registry import AlgoRegistry
+from repositories.algo_results_repository import AlgoResultsRepository
 from repositories.market_data_repository import MarketDataRepository
 from ui.algo_picker_dialog import AlgoPickerDialog
-from ui.playground_chart_service import PlaygroundChartService
+from ui.playground_chart_service import OVERLAY_COLORS, PlaygroundChartService
 
 # Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
 # wird in global_settings abgelegt (save_global_value/get_global_value).
@@ -62,6 +66,19 @@ class AlgoPlaygroundController(QObject):
         self._last_pair: Optional[Tuple[str, str]] = None
         self._chart_service = PlaygroundChartService()
         self._data_repo = MarketDataRepository()
+
+        # Phase 5: Overlay-Ergebnisse + Ergebnis-Persistenz + Debounce.
+        self._overlays: Dict[str, Dict[str, pd.Series]] = {}
+        # Stabile Overlay-Farbe je Instanz (Farbzyklus, Phase 5.3).
+        self._overlay_colors: Dict[str, str] = {}
+        self._results_repo = AlgoResultsRepository()
+        # Debounce (300ms, Konzept 2.2): nur der betroffene Algo wird
+        # nach Parameter-Aenderung neu berechnet.
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self._on_debounce_timeout)
+        self._pending_recalc: Optional[str] = None  # instance_key oder "all"
 
         self._init_bindings()
 
@@ -113,27 +130,44 @@ class AlgoPlaygroundController(QObject):
             # Neue Instanzen mit Schema-Defaults initialisieren.
             for algo_id, key in new_instances:
                 self.instance_params[key] = self._schema_defaults(algo_id)
+                # Phase 5: Overlay sofort berechnen + in DB speichern.
+                self._recalc_overlay(key)
             self.ui.status_label.setText(
                 f"Status: {len(chosen)} Algo(s) hinzugefuegt "
                 f"(gesamt {len(self.active_algos)})")
+            # Canvas neu rendern, damit die neuen Overlays sichtbar werden.
+            self._render_chart()
 
     def _on_algo_removed(self, algo_id: str, instance_key: str) -> None:
-        """Kontextmenue 'Entfernen': Zustand nachfuehren."""
-        # Parameter der entfernten Instanz verwerfen.
+        """Kontextmenue 'Entfernen': Zustand nachfuehren (Phase 5: + DB)."""
+        # Parameter/Overlay/Farbe der entfernten Instanz verwerfen.
         self.instance_params.pop(instance_key, None)
+        self._overlays.pop(instance_key, None)
+        self._overlay_colors.pop(instance_key, None)
+        # Gespeicherte Ergebnisse aus app_data.duckdb loeschen (Phase 5).
+        try:
+            self._results_repo.delete_for_instance(
+                algo_id, instance_key,
+                getattr(self.ui, "current_symbol", lambda: "?")(),
+                getattr(self.ui, "current_timeframe", lambda: "?")())
+        except Exception as exc:
+            print(f"WARN [Playground] Ergebnis-Delete {instance_key}: {exc}")
         if self.selected_instance == instance_key:
             self.selected_instance = None
             self.ui.param_form.set_schema({})
         self.active_algos = list(self.ui.algo_panel.algo_ids())
         self.ui.status_label.setText(
             f"Status: {algo_id} entfernt (aktiv: {len(self.active_algos)})")
+        # Canvas neu rendern, damit das Overlay verschwindet.
+        self._render_chart()
 
     def _on_visibility_changed(self, algo_id: str, instance_key: str,
                                checked: bool) -> None:
-        """Checkbox geaendert (Darstellung ein/aus) – Phase 6 rendert neu."""
+        """Checkbox geaendert: Overlay ein/ausblenden (KEIN Neuberechnen)."""
         state = "ein" if checked else "aus"
         self.ui.status_label.setText(
             f"Status: {algo_id} Darstellung {state}")
+        self._render_chart()
 
     def _on_algo_selected(self, algo_id: str, instance_key: str) -> None:
         """Eintrag angeklickt: Parameter-Form mit Schema + Werten befuellen."""
@@ -146,12 +180,20 @@ class AlgoPlaygroundController(QObject):
             f"Status: Parameter fuer {algo_id} geladen")
 
     def _on_params_changed(self, params: Dict[str, Any]) -> None:
-        """Parameter geaendert: pro Instanz speichern (Phase 6: Debounce)."""
+        """Parameter geaendert: speichern + Neuberechnung (Debounce 300ms).
+
+        Phase 5: Nach Aenderung wird NUR die betroffene Instanz neu
+        berechnet (get_overlay_series) – aber erst nach Ablauf der
+        Debounce-Frist, damit schnelles Tippen in SpinBoxes nicht hunderte
+        Berechnungen/DB-Writes ausloest.
+        """
         if self.selected_instance is None:
             return
         self.instance_params[self.selected_instance] = dict(params)
         self.ui.status_label.setText(
-            "Status: Parameter geaendert (Phase 6: Neuberechnung)")
+            "Status: Parameter geaendert – Neuberechnung ...")
+        self._pending_recalc = self.selected_instance
+        self._debounce.start()
 
     # ------------------------------------------------------------------
     # Persistenz (Anforderung 0: alle aktuellen Werte im Fenster)
@@ -273,6 +315,9 @@ class AlgoPlaygroundController(QObject):
         Cache (Konzept 2.4: einmaliges Laden pro (Symbol, TF)-Paar).
         """
         self._load_candles(force_reload=force_reload)
+        # Phase 5: Datenkontext geaendert -> ALLE Overlays neu berechnen
+        # (neue Kerzen koennen neue Overlay-Werte liefern) + DB aktualisieren.
+        self._recalc_all_overlays()
         if force_reload:
             # Nach einem Sync: sichtbaren Bereich bis zur neuesten Kerze
             # erweitern, damit die neuen Daten auch angezeigt werden.
@@ -351,13 +396,142 @@ class AlgoPlaygroundController(QObject):
         symbol = getattr(self.ui, "current_symbol", lambda: "?")()
         timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
         from_epoch, to_epoch = self.ui.time_range.get_range()
+        # Phase 5: sichtbare Overlay-Traces (Checkbox ein + Zeitraum-Slice).
+        checked: Dict[str, bool] = {}
+        if hasattr(self.ui, "algo_panel"):
+            checked = self.ui.algo_panel.checked_states()
+        overlays = self._build_overlay_traces(checked)
         html = self._chart_service.build_candlestick_html(
-            self._candles_cache, from_epoch, to_epoch, symbol, timeframe)
+            self._candles_cache, from_epoch, to_epoch, symbol, timeframe,
+            overlays=overlays)
 
         assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "assets")
         canvas.setHtml(html, QUrl.fromLocalFile(
             os.path.normpath(assets_dir).replace("\\", "/") + "/"))
+
+    # ------------------------------------------------------------------
+    # Phase 5: Overlays (Berechnung, Farben, DB-Persistenz, Debounce)
+    # ------------------------------------------------------------------
+    def _on_debounce_timeout(self) -> None:
+        """Debounce abgelaufen: betroffene Instanz neu berechnen + rendern."""
+        if self._pending_recalc is None:
+            return
+        key = self._pending_recalc
+        self._pending_recalc = None
+        self._recalc_overlay(key)
+        self.ui.status_label.setText("Status: Parameter angewendet")
+        self._render_chart()
+
+    def _recalc_all_overlays(self) -> None:
+        """Berechnet alle Instanz-Overlays neu (Datenkontext geaendert)."""
+        for key in list(self.ui.algo_panel.instance_keys()):
+            self._recalc_overlay(key)
+
+    def _recalc_overlay(self, instance_key: str) -> None:
+        """Berechnet die Overlay-Serien EINER Instanz (vektorisiert, Phase 5).
+
+        Holt algo_id + Parameter, instanziiert den Algo und ruft
+        `get_overlay_series(self._candles_cache)` auf. Ergebnis wird
+        gehalten in self._overlays[instance_key] und – fuer Felder mit
+        store='series'/'both' – in der DB persistiert (AlgoResultsRepository).
+        """
+        panel = self.ui.algo_panel
+        keys = panel.instance_keys()
+        if instance_key not in keys:
+            return
+        algo_id = panel.algo_ids()[keys.index(instance_key)]
+        entry = self.registry.get(algo_id)
+        if entry is None or not entry.get("has_overlay"):
+            # Algo ohne Overlay-Hook -> keine Traces fuer diese Instanz.
+            self._overlays.pop(instance_key, None)
+            return
+
+        try:
+            algo = entry["class"](
+                **(self.instance_params.get(instance_key) or {}))
+        except Exception as exc:
+            print(f"WARN [Playground] Instanzierung {algo_id}: {exc}")
+            self._overlays.pop(instance_key, None)
+            return
+
+        if self._candles_cache is None or self._candles_cache.empty:
+            self._overlays[instance_key] = {}
+            return
+
+        try:
+            series_dict = algo.get_overlay_series(self._candles_cache)
+        except Exception as exc:
+            print(f"WARN [Playground] Overlay {algo_id}: {exc}")
+            self._overlays[instance_key] = {}
+            return
+
+        overlays = dict(series_dict) if isinstance(series_dict, dict) else {}
+        self._overlays[instance_key] = overlays
+
+        # DB-Persistenz (Phase 5): nur store='series'|'both'-Felder.
+        symbol = getattr(self.ui, "current_symbol", lambda: "?")()
+        timeframe = getattr(self.ui, "current_timeframe", lambda: "?")()
+        result_schema = entry.get("result_schema") or {}
+        for name, spec in result_schema.items():
+            spec = spec if isinstance(spec, dict) else {}
+            store = str(spec.get("store", "series"))
+            series = overlays.get(name)
+            if store in ("series", "both") and series is not None:
+                try:
+                    self._results_repo.save_series(
+                        algo_id, instance_key, symbol, timeframe,
+                        name, series)
+                except Exception as exc:
+                    print(f"WARN [Playground] DB-Save {algo_id}.{name}: {exc}")
+
+    def _color_for_instance(self, instance_key: str) -> str:
+        """Weist einer Instanz eine stabile Overlay-Farbe zu (Farbzyklus)."""
+        if instance_key not in self._overlay_colors:
+            idx = len(self._overlay_colors) % len(OVERLAY_COLORS)
+            self._overlay_colors[instance_key] = OVERLAY_COLORS[idx]
+        return self._overlay_colors[instance_key]
+
+    def _build_overlay_traces(self, checked: Dict[str, bool]) -> List[dict]:
+        """Baut die sichtbaren Overlay-Traces fuer den Canvas (Zeitraum-Slice).
+
+        Nur Instanzen mit aktivierter Checkbox. Die Serien werden auf den
+        sichtbaren Zeitraum geschnitten, damit sie die X-Achse nicht ueber
+        den Candlestick-Bereich hinaus dehnen (Konzept 2.4: Slicen statt
+        Neuladen). Rueckgabe-Format passt zum `overlays`-Parameter des
+        PlaygroundChartService.
+        """
+        if not self._overlays:
+            return []
+        from_epoch, to_epoch = self.ui.time_range.get_range()
+        panel = self.ui.algo_panel
+        keys = panel.instance_keys()
+        ids = panel.algo_ids()
+        traces: List[dict] = []
+        for key in keys:
+            if checked.get(key, True) is False:
+                continue  # Checkbox aus -> Overlay unsichtbar
+            overlays = self._overlays.get(key)
+            if not overlays:
+                continue
+            idx = keys.index(key)
+            algo_id = ids[idx] if idx < len(ids) else "?"
+            color = self._color_for_instance(key)
+            for name, series in overlays.items():
+                if series is None or len(series) == 0:
+                    continue
+                mask = (series.index >= int(from_epoch)) & \
+                       (series.index <= int(to_epoch))
+                s = series.loc[mask]
+                if s.empty:
+                    continue
+                traces.append({
+                    "name": f"{algo_id} ({name})",
+                    "x": s.index.tolist(),
+                    "y": s.tolist(),
+                    "color": color,
+                })
+        return traces
 
     # ------------------------------------------------------------------
     # Interne Helfer

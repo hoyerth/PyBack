@@ -62,6 +62,7 @@ class AlgoRegistry:
                 name = str(getattr(algo_cls, "name", None) or module_name)
                 description = str(getattr(algo_cls, "description", None) or "")
                 schema = getattr(algo_cls, "parameter_schema", None) or {}
+                result_schema = getattr(algo_cls, "result_schema", None) or {}
 
                 registry[algo_id] = {
                     "class": algo_cls,
@@ -69,6 +70,9 @@ class AlgoRegistry:
                     "name": name,
                     "description": description,
                     "schema": schema,
+                    # Ergebnis-Felder (Phase 5): {name: {type, store, ...}}
+                    # store: series (pro Kerze) | agg (pro Lauf) | both.
+                    "result_schema": result_schema,
                     # Overlay-Hook vorhanden? (Playground-Vertrag)
                     "has_overlay": callable(getattr(algo_cls, "get_overlay_series", None)),
                     # Optionaler Backtest-Vertrag (spaeteres Backtest-Fenster)

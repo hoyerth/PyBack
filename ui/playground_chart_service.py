@@ -52,6 +52,21 @@ _PLOTLY_CONFIG = {
 # Dunkler Body-Hintergrund passend zum plotly_dark-Template (#111418 ist die
 # plotly_dark-Paper-Farbe, damit der Canvas nahtlos dunkel wirkt).
 _BODY_STYLE = "margin:0;padding:0;background:#111418;overflow:hidden"
+
+# Automatischer Farbzyklus fuer Algo-Overlays (Phase 5.3: erstmal automatisch;
+# spaeter je Algo einstellbar). Helle, auf Dark-Theme gut lesbare Farben.
+OVERLAY_COLORS = [
+    "#ff7f0e",  # orange
+    "#1f77b4",  # blau
+    "#2ca02c",  # gruen
+    "#d62728",  # rot
+    "#9467bd",  # violett
+    "#17becf",  # tuerkis
+    "#e377c2",  # pink
+    "#bcbd22",  # oliv
+    "#7f7f7f",  # grau
+    "#8c564b",  # braun
+]
 _EMPTY_HTML = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground</title></head>
@@ -75,6 +90,7 @@ class PlaygroundChartService:
         symbol: str,
         timeframe: str,
         hide_gaps: bool = True,
+        overlays: Optional[list] = None,
     ) -> str:
         """Baut das Candlestick-HTML fuer den sichtbaren Zeitraum.
 
@@ -88,6 +104,10 @@ class PlaygroundChartService:
             hide_gaps:  True (Default) -> Zeitluecken ohne Kerzen (Wochenende,
                 Handelspausen, kurze Handelstage) werden in der X-Achse
                 ausgeblendet (wie bei TradingView, Anwender-Anforderung).
+            overlays:   Optional. Liste von Overlay-Traces der Form
+                {"name": str, "x": pd.Series/Liste (Epochs),
+                 "y": pd.Series/Liste, "color": str} – wird als Liniengrafik
+                ueber die Candles gelegt (Phase 5).
 
         Returns:
             Standalone-HTML-String (plotly.js offline als Datei referenziert).
@@ -122,6 +142,26 @@ class PlaygroundChartService:
             increasing_line_color="#26a69a",
             decreasing_line_color="#ef5350",
         ))
+
+        # Algo-Overlays (Phase 5): Linien-Traces ueber die Candles.
+        if overlays:
+            for ov in overlays:
+                if not isinstance(ov, dict):
+                    continue
+                ov_x = ov.get("x")
+                ov_y = ov.get("y")
+                if ov_x is None or ov_y is None:
+                    continue
+                # Epochs -> Wanduhr-Datetime (naiv, wie bei den Candles).
+                ov_x_dt = pd.to_datetime(list(ov_x), unit="s")
+                fig.add_trace(go.Scatter(
+                    x=ov_x_dt,
+                    y=list(ov_y),
+                    name=str(ov.get("name", "Overlay")),
+                    mode="lines",
+                    line=dict(color=str(ov.get("color", "#ff7f0e")), width=1.5),
+                    hovertemplate="%{y:.4f}<extra>%{fullData.name}</extra>",
+                ))
 
         fig.update_layout(
             template="plotly_dark",
