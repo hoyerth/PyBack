@@ -288,24 +288,29 @@ class ParamFormWidget(QWidget):
 
     def _style_from_params(self, name: str, color: Any,
                            params: Dict[str, Any]):
-        """Baut das LineStyle/MarkerStyle aus color + Siblings (set_params)."""
+        """Baut das LineStyle/MarkerStyle aus color + Siblings (set_params).
+
+        Bugfix 17.08.2026: Sibling-Keys (z. B. 'bull_width'/'bear_width')
+        werden NUR uebernommen, wenn sie im Schema existieren (color_only-
+        Farbfelder wie bull/bear haben KEINE Siblings) - sonst KeyError.
+        """
         spec = self._schema.get(name, {})
         style_type = str(spec.get("style_type", "line"))
         sib1, sib2 = self._style_sibling_keys(name, style_type)
         if style_type == "marker":
             style = MarkerStyle(color=str(color))
-            if sib1 and params.get(sib1) in PLOTLY_SYMBOLS:
+            if sib1 and sib1 in self._schema and params.get(sib1) in PLOTLY_SYMBOLS:
                 style.symbol = str(params[sib1])
-            if sib2:
+            if sib2 and sib2 in self._schema:
                 try:
                     style.size = int(params[sib2])
                 except (TypeError, ValueError):
                     pass
             return style
         style = LineStyle(color=str(color))
-        if sib1 and params.get(sib1) in LINE_STYLES:
+        if sib1 and sib1 in self._schema and params.get(sib1) in LINE_STYLES:
             style.style = str(params[sib1])
-        if sib2:
+        if sib2 and sib2 in self._schema:
             try:
                 style.width = int(params[sib2])
             except (TypeError, ValueError):

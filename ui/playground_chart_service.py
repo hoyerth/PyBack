@@ -257,19 +257,26 @@ class PlaygroundChartService:
                 "hovertemplate": "%{y:.4f}<extra>%{fullData.name}</extra>",
             }
             if "lines" in mode:
-                trace["line"] = dict(
-                    color=color,
+                line_opts: dict = dict(
                     dash=str(ov.get("dash", "solid")),
                     width=float(ov.get("width", 1.5)),
                     # Bugfix 17.08.2026 (SMA-Linie): connectgaps=True
                     # verhindert sichtbare Luecken/Brueche bei NaN-Warmup
                     # (erste period-1 Kerzen) und internen NaN-Gaps – die
                     # Linie bleibt durchgehend im sichtbaren Bereich.
-                    # USER-REQ (17.08.2026, alg_ma dual_color):
-                    # Segment-Traces setzen connectgaps=False (Farbwechsel
-                    # als sichtbare Brueche) – Default bleibt True.
                     connectgaps=bool(ov.get("connectgaps", True)),
                 )
+                # Bugfix 17.08.2026 (alg_ma dual_color): line_colors-Array
+                # faerbt jedes Liniensegment mit der Farbe seines Startpunkts
+                # (Plotly scatter.line.color als Liste) -> lueckenloser
+                # Bull/Bear-Verlauf statt Segment-Splitting mit Luecken.
+                line_colors = ov.get("line_colors")
+                if line_colors is not None and isinstance(
+                        line_colors, (list, tuple)) and len(line_colors) > 0:
+                    line_opts["color"] = [str(c) for c in line_colors]
+                else:
+                    line_opts["color"] = color
+                trace["line"] = line_opts
             if "markers" in mode:
                 trace["marker"] = dict(
                     color=color,

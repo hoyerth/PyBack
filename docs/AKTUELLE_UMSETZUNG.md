@@ -226,3 +226,36 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 ### Bedienung
 
 * Algo "MA" im Playground: MA-Typ (12 Optionen), Periode, Glaettung, Decay-Faktor; Checkbox "Auf/Ab verschiedene Farben" + Farbfelder Gruen/Rot fuer aufsteigend/absteigend. Ohne dual_color gilt der Stil-Picker (Farbe/Linienart/Staerke).
+
+---
+
+## Implementierungs-Log: Bugfix-Runde MA-Algo / Playground (17.08.2026, 18:42)
+
+> **Anwender-Bugmeldungen (Bugfixing-Modus):**
+> 1. **Luecke zwischen den Linien bei auf/absteigend** (dual_color-MA zeigt sichtbaren Bruch am Farbwechsel).
+> 2. **Grafik-Reset bei Einstellungsaenderung** (Ansicht springt nach >5 s Idle zurueck auf vollen Zeitraum).
+> 3. „Bugfixing mode" – reine Modus-Aktivierung, kein Bug.
+> 4. **KeyError `bull_width`/`bear_width`** beim `set_params`-Pfad der bull/bear-Farbfelder.
+>
+> Alle Fixes vom Anwender als funktionierend bestaetigt.
+
+### Befunde & Fixes
+
+* **Fix #1 (Luecke zwischen den Linien):** Der dual_color-Render nutzte Segment-Traces (je Farbblock ein Trace mit NaN-Luecken an Farbwechseln, `connectgaps=False`) – an high/low ueberlappenden Segmentenden entstand eine sichtbare Luecke. **Fix:** Statt Segment-Splitting rendert der Controller jetzt **EINEN Trace** mit Plotly-`line.color`-**Array** (`line_colors`, eine Farbe je Datenpunkt). Plotly faerbt jedes Liniensegment mit der Farbe seines Startpunkts – der Verlauf ist lueckenlos (`connectgaps=True`). `_build_segment_traces` entfernt.
+* **Fix #2 (Grafik-Reset bei Einstellungsaenderung):** Nach `VIEW_POLL_IDLE_S` (5 s) Idle ist `_last_view` veraltet; `_render_chart(preserve_view=True)` wendete dann einen alten Zoom an. **Fix:** In `_on_visibility_changed` UND `_on_params_changed` wird vor dem Render `_last_interaction = time.monotonic()` gesetzt (View-Poll reaktiviert) und `_request_view_read()` aufgerufen (Zoom frisch asynchron gelesen) – die Ansicht bleibt stabil.
+* **Fix #4 (KeyError `bull_width`/`bear_width`):** `_style_from_params` griff beim `set_params`-Pfad auf Sibling-Keys zu (`_style_sibling_keys("bull_color","line")` → `("bull_style","bull_width")`), die bei `color_only`-Farbfeldern (bull/bear) nicht im Schema existieren → KeyError. **Fix:** Sibling-Keys werden nur uebernommen, wenn sie im Schema vorhanden sind (`sib1 in self._schema` / `sib2 in self._schema`) – Marker- und Line-Zweig.
+
+### Aenderungen
+
+| Datei | Inhalt |
+|-------|--------|
+| `controllers/algo_playground_controller.py` | `_build_instance_traces`: Tupel-Wert (Serie, Farben) → Slice + LOD mit passendem Farb-Slice (`mask[i]` statt `mask.iloc[i]`, numpy-Array) → Trace mit `line_colors` + `connectgaps=True`. `_build_segment_traces` geloescht. `_on_visibility_changed`/`_on_params_changed`: `_last_interaction` + `_request_view_read()` vor dem Render. |
+| `ui/playground_chart_service.py` | `build_chart_figure`: `line_opts["color"]` wird bei vorhandenem `line_colors`-Array als Liste gesetzt (sonst Einzelfarbe); `connectgaps`-Lesart unveraendert (Default True). |
+| `ui/param_form_widget.py` | `_style_from_params`: Sibling-Keys nur bei Existenz im Schema uebernehmen (verhindert KeyError bei `color_only`-Farbfeldern). |
+| `test/check_alg_ma.py` | **Neu (lokal, gitignored):** Validator erweitert – Controller-dual_color (EIN Trace, line_colors lueckenlos), Chart-Service-line_colors (line.color-Array, JSON-sicher), set_params-Bugfix ohne KeyError. |
+
+### Verifikation (headless, keine UI)
+
+* `test/check_alg_ma.py` – **alle 10 Checks OK** (inkl. Parity alle 12 MA-Typen gegen PyTrader, line_colors-Array, KeyError-Bugfix).
+* `test/test.py` – komplette Suite **alle Phasen 0–7 OK** (keine Regression).
+* `py_compile` auf allen 3 geaenderten Dateien OK.
