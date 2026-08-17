@@ -19,3 +19,98 @@
 
 ---
 
+ 1) Architektonische Prüfung
+
+ Stärken
+ - Saubere Schichtung: UI (Views) → Controller (Presenter) → QThread-Worker → Repository → DuckDB. SRP überwiegend eingehalten.
+ - Gute Entkopplung: EventBus, Signals/Slots, WindowManager ohne MainWindow-Import, PersistentWindow-Registry, thread-lokaler DbPool mit WAL-Recovery.
+ - Vektorisierte Algos (pandas rolling), defensive Algo-Registry, RAM-only Overlay-Cache mit Generation-Counter gegen veraltete Worker-Ergebnisse.
+
+ Schwächen
+ | # | Befund | Ort |
+ |---|--------|-----|
+ | A1 | Render-Strategie ist der architektonische Flaschenhals: Bei jeder Änderung (Zeitraum, Preset, Symbol/TF, Sync, Start) wird das komplette HTML neu gebaut und via canvas.setHtml() ein voller Seiten-Reload ausgelöst. Es gibt keine
+ persistente JS-Bridge / kein Diffing – Inkrementelles addTraces/deleteTraces existiert nur für Overlay-Checkboxen. | _render_chart() (Controller) + build_candlestick_html() |
+ | A2 | God-Object: algo_playground_controller.py (49 KB) macht alles: Registry, Liste, Params, Canvas, View-Persistenz, Overlay-Orchestrierung, Worker-Pool. | controllers/ |
+ | A3 | Datenmodell redundant: 20,0 Mio. Zeilen / 1,31 GB. M2/M5/M10/M15/M30/H4 sind reine Aggregationen von M1 (z. B. BTCUSD M1=3,6 Mio + M2=1,9 Mio + M5=0,8 Mio …). Kein Index auf ohlcv_bars. | data/market_data.duckdb |
+ | A4 | CANDLE_LIMIT=5000 vs. Zeitraum-Picker (1T…YTD): Default-Zeitraum = 30 Tage → M1 bräuchte 43.200 Kerzen. Geladen werden nur die letzten 5000 (~3,5 Tage). Ergebnis: fast leeres Chart mit gequetschten Kerzen am rechten Rand. |
+ CANDLE_LIMIT im Controller |
+ | A5 | Zwei Queries pro Laden (precision + Candles), beide mit LOWER() und ohne Index; Cache-Verhalten nur „1× pro Paar", kein Zeitraum-bezogenes Nachladen. | market_data_repository.py |
+ | A6 | state_manager = Fassade + Migrationslogik (gemischte Verantwortung, minor). | state_manager.py |
+
+ ---
+
+ 2) Performance-Messungen (real, gegen `market_data.duckdb`)
+
+ | Messung | Ergebnis | Bewertung |
+ |--------|----------|-----------|
+ | DB-Load 5000 Kerzen (SILVER M1) | 64 ms | ok, aber 2 Queries + Full-Scan ohne Index |
+ | HTML-Build (Python) 5000 Kerzen | 80–275 ms | spürbar, aber nicht dominant |
+ | to_html()-Serialisierung allein | 13 ms | unkritisch |
+ | `setHtml()` → Seiten-Reload (341 KB HTML + 4,8 MB plotly.min.js neu laden + 5000 Candlestick-Render + rangebreaks + x-unified-Hover) | ~0,5–2 s | dominant – passiert bei jedem Render |
+ | Overlay-JS: [str(pd.to_datetime(int(t), unit='s')) for t in x] | 302 ms / 5000 Pkte | 16× langsamer als vektorisiert (19 ms) |
+ | Datenmenge gesamt | 20 Mio. Zeilen, SILVER M1 allein 3,27 Mio. | Chart nutzt nur 5000 |
+
+ Fazit: Die „Lahmheit" kommt fast ausschließlich vom Seiten-Reload pro Render (A1) – nicht von DuckDB (64 ms). Sekundär: 5000 volle Candlestick-Punkte ohne LOD + teures Hover + Overlay-Schleifen.
+
+ ---
+
+ 3) Vorschläge (priorisiert, in eine Textbox kopierbar)
+
+ P0 – Größte Wirkung gegen „lahm"
+ 1. `setHtml` nur noch einmal (Struktur/Initial). Alle Daten-Updates (Zeitraum, Preset, Kerzen, Params, Sync) künftig über `Plotly.react()`/`restyle` per `runJavaScript` mit neuen Daten-Arrays. Zoom/Pan bleibt erhalten, kein
+ plotly.min.js-Re-Load mehr. Erwartung: 0,5–2 s → ~50–150 ms.
+ 2. LOD/Downsampling mit NumPy: Wenn sichtbare Kerzen > ~1.000–1.500, OHLC-Buckets vektorisiert bilden (np.minimum.reduceat / np.maximum.reduceat bzw. pandas resample) und nur reduzierte Daten rendern. Beim Reinzoomen volle Auflösung.
+ 3. Overlay-Datums-Konvertierung vektorisieren: pd.to_datetime(epochs, unit='s').strftime('%Y-%m-%dT%H:%M:%S').tolist() statt Element-Schleife in _js_add_overlay/_js_update_overlay (302 → 19 ms).
+
+ P1 – Datenmengen / DB
+ 4. Index CREATE INDEX idx_ohlcv_pair_time ON ohlcv_bars(symbol, timeframe, time) – Range-Queries und Sync-Updates deutlich schneller.
+ 5. Zeitraum-basiertes Laden statt „immer letzte 5000": WHERE time BETWEEN ? AND ? – nur sichtbare Kerzen laden; Limit vom gewählten Zeitraum abhängig + LOD-Kappung. Behebt zugleich das „fast leere 30-Tage-Chart" (A4).
+ 6. Precision-Query cachen (1× pro Paar) oder in die Candle-Query integrieren.
+ 7. Datenmodell entschlacken: M2/M5/… aus M1 aggregieren (oder bei Bedarf lazy erzeugen) → DB-Größe massiv reduzieren; VOLLIMPORT nur einmalig, danach strikt Delta.
+
+ P2 – Weitere Render-Optimierungen
+ 8. Hover: bei >N Kerzen hovermode="x unified" → "closest" schalten oder Bucket-Hover (hoverinfo="skip").
+ 9. Startup-Doppel-Render vermeiden (Konstruktor-refresh_chart + Sync-Refresh bündeln).
+ 10. _poll_view-Timer (500 ms) + singleShot(500) nach jedem Render → nur bei Interaktion lesen.
+ 11. Statt pro Overlay-Instanz ein QThread → ein Worker mit Job-Queue (weniger Thread-Overhead bei vielen Instanzen).
+
+ P3 – Architektur / Struktur
+ 12. Controller aufteilen (ChartRenderService, OverlayManager, ViewPersistence).
+ 13. In Algos konsequent to_numpy() / NumPy verwenden (pandas-Index-Overhead vermeiden); laut Agents.md profile-Modus von vectorbt als Standard-Schritt nutzen.
+
+  Kurzfassung: Hauptproblem = kompletter Seiten-Reload bei jedem Render (A1). Fix 1+2 bringt die größte spürbare Beschleunigung; Fix 4+5 macht die Datenmengen beherrschbar.
+
+---
+
+## Implementierungs-Log: Performance-Optimierung Playground (17.08.2026)
+
+> Taxonomie: P0#1/P0#2/P0#3 (Render), P1#4/P1#5/P1#6 (Daten/DB), P2#8/P2#10 (Render/View).
+> Auftrag: "Arbeite alles ab in sinnvoller Reihenfolge" – umgesetzt auf Basis der Pro-Analyse (Abschnitte 1-3 oben).
+
+### Umgesetzte Punkte
+
+| # | Massnahme | Datei(en) | Messung / Bewertung |
+|---|-----------|-----------|---------------------|
+| P0#1 | **setHtml nur 1x** – _render_chart baut jetzt eine schlanke Plotly-Figur (uild_chart_figure), die Page-Shell (uild_page_html, feste Div pg-chart) wird EINMAL via setHtml gesetzt; alle Folge-Render laufen per Plotly.react() über unJavaScript (kein Seiten-Reload, kein plotly.min.js-Re-Load, Zoom/Pan bleibt erhalten). _on_canvas_load_finished + _pending_figure_json sichern den Erst-Render (idempotent). | ui/playground_chart_service.py, controllers/algo_playground_controller.py | 342 KB HTML + 4,8 MB JS-Reload (0,5–2 s) → ~119 KB react-JSON (~50–150 ms). Leere Zustände (Hinweis-HTML) bleiben der seltene setHtml-Ausnahmefall. |
+| P0#2 | **LOD/Downsampling** – Candlestick: bei > 1200 sichtbaren Kerzen vektorisiert zu OHLC-Buckets via 
+p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationskonvention); Overlays: _decimate_series (np.linspace, Endpunkte erhalten). Rangebreaks werden auf den ORIGINAL-Zeiten vor dem Downsampling berechnet (Lücken-Grenzen exakt). | ui/playground_chart_service.py (_maybe_downsample), controllers/algo_playground_controller.py | 43.200 M1-Kerzen (30 Tage) → 1.200 Render-Punkte; 30-Tage-M1 rendert jetzt vollständig (A4-Fix-Voraussetzung). |
+| P0#3 | **Overlay-Datums-Konvertierung vektorisiert** – _epochs_to_iso statt Element-Schleife in _js_add_overlay/_js_update_overlay. | controllers/algo_playground_controller.py | gemessen: 29,8 ms vs. 336 ms pro 5.000 Punkte (~11× schneller; Pro-Schätzung 302→19 ms bestätigt). |
+| P1#4 | **Index** – CREATE INDEX IF NOT EXISTS idx_ohlcv_pair_time ON ohlcv_bars(symbol, timeframe, time) idempotent in schema_initializer (einmalig ~15 s bei 20 Mio. Zeilen). **Wichtig (eigene Messung):** DuckDB 1.5.5 nutzt ARTEMIS fuer die Range-Query in der Praxis nicht (Spaltenscan der ~2 Mio. SILVER-M1-Zeilen ist warm ohnehin ~0 ms) – der Index bleibt als Punkt-Lookup/Reproduzierbarkeit, ist aber NICHT der Performance-Gewinn. | db/schema_initializer.py | 0 Indexe vorher → 1 Index; Range-Query 27.624 Zeilen in 68,7 ms. |
+| P1#5 | **Zeitraum-basiertes Laden** – etch_candles_in_range (WHERE time BETWEEN, ORDER BY time DESC LIMIT ? → ASC) statt "letzte 5000"; Controller-Cache deckt den Zeitraum + 15 % Margin ab (_cache_covers mit 1 %/1 h Toleranz), _on_range_changed lädt nur bei nicht abgedecktem Bereich nach. Behebt A4 (fast leeres 30-Tage-Chart). CANDLE_LIMIT=5000 ersetzt durch MAX_CACHE_CANDLES=200_000. | epositories/market_data_repository.py, controllers/algo_playground_controller.py | 30-Tage-M1: 27.624 Kerzen in 68,7 ms (statt 5.000/3,5 Tage); Cache bleibt bei kleinen Verschiebungen erhalten (Tests grün). |
+| P1#6 | **Precision-Query gecacht** (1× pro Paar, _precision_cache) + Queries von LOWER(symbol)=LOWER(?) auf symbol = UPPER(?) umgestellt (Daten sind UPPER-normalisiert, Verifikation: 0 Abweichungen) → keine Funktions-Scans auf der Spalte. | epositories/market_data_repository.py | 1 Precision-Query statt 1 pro Load; DRY über _get_precision_cached/_rows_to_candles. |
+| P2#8 | **Hover adaptiv** – > 1200 sichtbare Kerzen → hovermode="closest", sonst "x unified" (Entscheidung vor LOD auf Original-Anzahl). | ui/playground_chart_service.py | teures unified-Hover entfällt bei grossen Zeiträumen. |
+| P2#10 | **View-Poll nur bei Interaktion** – _poll_view überspringt den Timer nach 5 s Idle (VIEW_POLL_IDLE_S); save_state liest beim Schliessen weiterhin explizit (+ 300 ms Event-Pump) → kein Zoom-Verlust. | controllers/algo_playground_controller.py | Idle-Lasten (runJavaScript alle 500 ms) sinken auf ~0. |
+
+### Bewusst NICHT umgesetzt (Begründung)
+
+* **P1#7 (Datenmodell entschlacken: M2/M5/… aus M1 aggregieren):** betrifft die Sync-/Import-Schicht, nicht die Playground-Lahmheit; grosser Eingriff mit Datenmigrations-Risiko – separat zu planen.
+* **P2#9 (Startup-Doppel-Render bündeln):** durch P0#1 erledigt sich das Problem faktisch (Folge-Render sind billige react-Aufrufe, kein 2. Seiten-Reload mehr).
+* **P2#11 (Worker-Job-Queue), P3#12/#13 (Controller aufteilen, Algos to_numpy):** Architektur-Refactoring ohne direkten Performance-Gewinn fuer die gemessene Lahmheit – Folgeschritt, nicht Teil dieser Runde.
+
+### Verifikation (headless, keine UI)
+
+* 	est/test.py – komplette Suite: **alle Phasen 0–7 OK** (Exit 0), inkl. angepasster FakeRepo-Stubs (etch_candles_in_range additiv).
+* 	est/check_optimize_impl.py – LOD-OHLC-Korrektheit, Figure-JSON (numpy-sicher, hovermode), _epochs_to_iso-Geschwindigkeit, Repository-Range + Precision-Cache, Controller-React-Flow (setHtml 1× + Plotly.react).
+* 	est/check_optimize_prep.py, check_optimize_index.py, check_optimize_index2.py, check_optimize_plotly_json.py, check_optimize_perf.py – Vorab-/Beweis-Messungen (Index, DuckDB-Version 1.5.5, JSON-Typen, Benchmark).
+* py_compile auf allen geaenderten Dateien OK.

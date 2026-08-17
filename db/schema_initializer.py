@@ -50,6 +50,17 @@ def check_and_init_databases() -> None:
     except Exception as e:
         print(f"⚠️ [MIGRATION WARNUNG] Migration konnte nicht durchgeführt werden: {e}")
 
+    # P1#4 (Optimierung, 17.08.2026): ARTEMIS-Index auf dem PK-Praefix
+    # (symbol, timeframe, time) fuer schnelle Punkt-/Bereichs-Lookups der
+    # Playground-Zeitraum-Queries. Idempotent: DuckDB legt den Index beim
+    # ersten Start nach diesem Update an (~15s bei 20 Mio. Zeilen), danach
+    # ist CREATE INDEX IF NOT EXISTS ein reiner Katalog-Check.
+    # USER-REQ (17.08.2026): Zeitraum-basiertes Laden (P1#5) nutzt exakt
+    # dieses Praefix-Praedikat (symbol+timeframe+time-Range).
+    con_market.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ohlcv_pair_time "
+        "ON ohlcv_bars(symbol, timeframe, time)")
+
     con_analytics = DbPool.get(DB_ANALYTICS)
     # USER-REQ (17.08.2026): analytics.duckdb enthaelt NUR die Persistierung
     # der Algos (algo_results). PyTrader-Fremdtabellen (analytics_metadata,
