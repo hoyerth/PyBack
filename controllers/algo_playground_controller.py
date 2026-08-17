@@ -28,6 +28,10 @@ from PySide6.QtWidgets import QDialog
 from algos.algo_registry import AlgoRegistry
 from ui.algo_picker_dialog import AlgoPickerDialog
 
+# Persistenz-Key (Anforderung 0, Phase 3): kompletter Playground-Zustand
+# wird in global_settings abgelegt (save_global_value/get_global_value).
+PLAYGROUND_STATE_KEY = "playground_state"
+
 
 class AlgoPlaygroundController(QObject):
     """Presenter des Algo-Playgrounds (Phase 2 + 3: Liste, Dialog, Params)."""
@@ -118,6 +122,110 @@ class AlgoPlaygroundController(QObject):
         self.instance_params[self.selected_instance] = dict(params)
         self.ui.status_label.setText(
             "Status: Parameter geaendert (Phase 6: Neuberechnung)")
+
+    # ------------------------------------------------------------------
+    # Persistenz (Anforderung 0: alle aktuellen Werte im Fenster)
+    # ------------------------------------------------------------------
+    def save_state(self) -> None:
+        """Persistiert den kompletten Playground-Zustand (Anforderung 0).
+
+        Gespeichert werden: Algo-Liste (algo_id, instance_key, Checkbox),
+        Parameter je Instanz, selektierte Instanz, Zeitraum (Von/Bis) und
+        beide Splitter-Positionen (horizontal + vertikal im linken Panel).
+        Abgelegt unter global_settings/playground_state (StateManager).
+        """
+        panel = self.ui.algo_panel
+        checked = panel.checked_states()
+        algos = [
+            {
+                "algo_id": panel.algo_ids()[i],
+                "instance_key": key,
+                "checked": checked.get(key, True),
+            }
+            for i, key in enumerate(panel.instance_keys())
+        ]
+        from_epoch, to_epoch = self.ui.time_range.get_range()
+        state = {
+            "version": 1,
+            "algos": algos,
+            "params": {key: dict(params)
+                       for key, params in self.instance_params.items()},
+            "selected_instance": self.selected_instance,
+            "time_range": [int(from_epoch), int(to_epoch)],
+            "splitter_main": [int(x) for x in self.ui.splitter.sizes()],
+            "splitter_left": [int(x) for x in self.ui.left_splitter.sizes()],
+        }
+        self.ui.state_manager.save_global_value(PLAYGROUND_STATE_KEY, state)
+
+    def restore_state(self) -> None:
+        """Stellt den persistierten Playground-Zustand wieder her.
+
+        Defensiv (Anforderung 0): Algos, die nicht mehr in der Registry
+        existieren, werden uebersprungen. Fehlende/ungueltige Felder werden
+        ignoriert. Splitter-Positionen erst nach der Fenster-Geometrie
+        anwenden (main_win ruft restore_state() nach restore_geometry auf).
+        """
+        sm = self.ui.state_manager
+        data = sm.get_global_value(PLAYGROUND_STATE_KEY)
+        if not isinstance(data, dict):
+            return
+
+        # -- Zeitraum ----------------------------------------------------
+        tr = data.get("time_range")
+        if isinstance(tr, list) and len(tr) == 2:
+            try:
+                from datetime import datetime
+                # fromtimestamp (lokale Wanduhr) statt utcfromtimestamp:
+                # liefert den exakten Epoch-Roundtrip (Wanduhr-Konvention,
+                # _to_qdt setzt die Komponenten naiv als lokale Zeit).
+                self.ui.time_range.set_range(
+                    datetime.fromtimestamp(int(tr[0])),
+                    datetime.fromtimestamp(int(tr[1])))
+            except (ValueError, OSError, OverflowError, TypeError):
+                pass  # ungueltige Epochs -> Standardbereich behalten
+
+        # -- Algo-Liste + Parameter + Checkboxen -------------------------
+        panel = self.ui.algo_panel
+        params = data.get("params") or {}
+        restored: List[tuple] = []  # (instance_key, algo_id)
+        for entry in data.get("algos") or []:
+            if not isinstance(entry, dict):
+                continue
+            algo_id = entry.get("algo_id")
+            if algo_id not in self.registry:
+                continue  # Algo existiert nicht mehr (defensiv)
+            key = panel.add_algo(
+                algo_id, self.registry[algo_id].get("name"),
+                instance_key=entry.get("instance_key"))
+            if entry.get("checked") is False:
+                panel.set_checked_instance(key, False)
+            stored = params.get(key)
+            self.instance_params[key] = (
+                dict(stored) if isinstance(stored, dict)
+                else self._schema_defaults(algo_id))
+            restored.append((key, algo_id))
+        self.active_algos = list(panel.algo_ids())
+
+        # -- Selektion ---------------------------------------------------
+        sel = data.get("selected_instance")
+        for key, algo_id in restored:
+            if key == sel:
+                self.selected_instance = key
+                self.ui.param_form.set_schema(
+                    self.registry.get(algo_id, {}).get("schema", {}))
+                self.ui.param_form.set_params(self.instance_params.get(key, {}))
+                break
+
+        # -- Splitter (nach Fenster-Geometrie!) --------------------------
+        for attr, key_name in (("splitter", "splitter_main"),
+                               ("left_splitter", "splitter_left")):
+            sizes = data.get(key_name)
+            if isinstance(sizes, list) and len(sizes) == 2:
+                try:
+                    getattr(self.ui, attr).setSizes(
+                        [int(sizes[0]), int(sizes[1])])
+                except (TypeError, ValueError):
+                    pass
 
     # ------------------------------------------------------------------
     # Interne Helfer

@@ -117,6 +117,11 @@ class MainWin(QMainWindow):
         # Letzte Groesse/Position des Hauptfensters wiederherstellen.
         self.restore_main_window_geometry()
 
+        # Playground-Zustand (Anforderung 0): Algos, Parameter, Zeitraum,
+        # Splitter-Positionen. Nach der Fenster-Geometrie, damit die
+        # Splitter-Sizes nicht durch das Resize ueberschrieben werden.
+        self.playground_controller.restore_state()
+
         # Gespeicherte Sub-Fenster (PropertiesWindow etc.) wiederherstellen.
         QTimer.singleShot(200, self.window_manager.restore_all_windows)
 
@@ -180,19 +185,38 @@ class MainWin(QMainWindow):
         # -- Zeitraum-Zeile (Playground, Phase 1) --------------------------
         self.time_range = TimeRangeWidget()
 
-        # -- Linkes Panel: Algo-Liste (Phase 2) + Parameter-Form (Phase 3) -
+        # -- Linkes Panel: Algo-Liste + Parameter-Form (vertikaler
+        #    Splitter, Anwender-Anforderung 1) --------------------------
+        # Beide Panes scrollen bei Platzmangel: QListWidget (Algo-Liste)
+        # und QScrollArea (ParamFormWidget) haben eingebaute Scrollbars.
         self.algo_panel = AlgoListPanel()
-
         self.param_form = ParamFormWidget()
-        self.param_form.setMinimumHeight(90)
+
+        algo_pane = QWidget()
+        algo_layout = QVBoxLayout()
+        algo_layout.setContentsMargins(0, 0, 0, 0)
+        algo_layout.addWidget(QLabel("Algo-Liste:"))
+        algo_layout.addWidget(self.algo_panel, 1)
+        algo_pane.setLayout(algo_layout)
+
+        param_pane = QWidget()
+        param_layout = QVBoxLayout()
+        param_layout.setContentsMargins(0, 0, 0, 0)
+        param_layout.addWidget(QLabel("Parameter:"))
+        param_layout.addWidget(self.param_form, 1)
+        param_pane.setLayout(param_layout)
+
+        self.left_splitter = QSplitter(Qt.Vertical)
+        self.left_splitter.addWidget(algo_pane)
+        self.left_splitter.addWidget(param_pane)
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 1)
+        self.left_splitter.setSizes([200, 160])  # Initiale Groessen
 
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("Algo-Liste:"))
-        left_layout.addWidget(self.algo_panel, 1)
-        left_layout.addWidget(QLabel("Parameter:"))
-        left_layout.addWidget(self.param_form)
+        left_layout.addWidget(self.left_splitter, 1)
         left_panel.setLayout(left_layout)
 
         # -- Rechter Bereich: Canvas-Platzhalter (Phase 4: QWebEngineView) --
@@ -355,12 +379,15 @@ class MainWin(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
-        """Speichert Groesse/Position von win_main und stellt stdout wieder her.
+        """Speichert Playground-Zustand + Groesse/Position von win_main.
 
-        Der StateManager persistiert die Geometrie unter der Instanz-ID
-        'win_main' (window_instances-Tabelle) – beim naechsten Start stellt
+        Der Playground-Zustand (Anforderung 0: aktive Algos, Parameter,
+        Zeitraum, Splitter-Positionen) wird ueber den Controller persistiert.
+        Zusaetzlich speichert der StateManager die Geometrie unter der
+        Instanz-ID 'win_main' – beim naechsten Start stellt
         restore_main_window_geometry() sie wieder her.
         """
+        self.playground_controller.save_state()
         p, s = self.pos(), self.size()
         self.state_manager.save_window_geometry(
             "win_main", p.x(), p.y(), s.width(), s.height(), self.isMaximized())

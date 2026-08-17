@@ -74,15 +74,20 @@ class AlgoListPanel(QWidget):
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
-    def add_algo(self, algo_id: str, display_name: Optional[str] = None) -> str:
+    def add_algo(self, algo_id: str, display_name: Optional[str] = None,
+                 instance_key: Optional[str] = None) -> str:
         """Fuegt einen Algo als (standardmaessig aktivierten) Eintrag hinzu.
 
         Args:
             algo_id: Registry-ID des AlgOS.
             display_name: Anzeigename (Default: algo_id).
+            instance_key: Optionale, bereits persistierte Instance-Key
+                (Restore). Ohne Angabe wird eine neue eindeutige Key erzeugt;
+                bei vorhandener Key wird der Zaehler ueber ihr numerisches
+                Suffix angehoben, damit keine Kollisionen entstehen.
 
         Returns:
-            instance_key des neuen Eintrags (eindeutig, fuer Duplikate).
+            instance_key des Eintrags (eindeutig, fuer Duplikate).
         """
         name = display_name or algo_id
         count = self._count_instances(algo_id)
@@ -90,8 +95,15 @@ class AlgoListPanel(QWidget):
         item = QListWidgetItem(f"{name}{suffix}")
         item.setData(Qt.UserRole, algo_id)
         # Eindeutige Instance-Key (Duplikate unterscheidbar, Phase 3).
-        self._instance_counter += 1
-        instance_key = f"inst_{self._instance_counter}"
+        if instance_key is None:
+            self._instance_counter += 1
+            instance_key = f"inst_{self._instance_counter}"
+        else:
+            # Zaehler ueber persistierte Keys heben (Kollisionen vermeiden).
+            parts = str(instance_key).rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                self._instance_counter = max(self._instance_counter,
+                                             int(parts[1]))
         item.setData(INSTANCE_KEY_ROLE, instance_key)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         # Standard: aktiviert (Overlay sichtbar).
@@ -143,6 +155,26 @@ class AlgoListPanel(QWidget):
                     return
         finally:
             self._updating = False
+
+    def set_checked_instance(self, instance_key: str, checked: bool) -> None:
+        """Setzt die Checkbox genau EINER Instanz (ohne Signal)."""
+        self._updating = True
+        try:
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                if item.data(INSTANCE_KEY_ROLE) == instance_key:
+                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    return
+        finally:
+            self._updating = False
+
+    def checked_states(self) -> dict:
+        """Liefert {instance_key: bool} der Sichtbarkeit aller Eintraege."""
+        return {
+            self.list_widget.item(i).data(INSTANCE_KEY_ROLE):
+            self.list_widget.item(i).checkState() == Qt.Checked
+            for i in range(self.list_widget.count())
+        }
 
     # ------------------------------------------------------------------
     # Interne Helfer
