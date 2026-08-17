@@ -128,7 +128,9 @@ class PlaygroundChartService:
             title=f"{symbol} {timeframe}",
             xaxis_rangeslider_visible=False,
             xaxis_title="Zeit (Wanduhr)",
-            yaxis_title="Preis",
+            # Preisachse (Y) auf der RECHTEN Seite wie bei TradingView/MT5
+            # (Anwender-Anforderung, 17.08.2026).
+            yaxis=dict(title="Preis", side="right"),
             margin=dict(l=40, r=20, t=50, b=30),
             autosize=True,
             hovermode="x unified",
