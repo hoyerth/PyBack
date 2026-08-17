@@ -108,35 +108,35 @@ main_win.py  = NUR Zusammenbau der Controls + 1 Controller-Zeile
 ## 3. Schrittanleitung (mit UI-Review-Stopps nach jedem UI-Schritt)
 
 ### Phase 0 – Fundamente (kein UI)
-- [ ] 0.1 `algos/algo_registry.py` erstellen (dynamischer, defensiver Scan von `alg_*.py`; Registry liest `parameter_schema` + Overlay-Hook aus)
-- [ ] 0.2 Ordner `controllers/` und `workers/` anlegen
-- [ ] 0.3 Test in `test/test.py`: Registry findet nichts, solange keine Algos existieren → sauberer 0-Zustand
-- [ ] 0.4 **Commit** (`playground_step1`)
+- [x] 0.1 `algos/algo_registry.py` erstellen (dynamischer, defensiver Scan von `alg_*.py`; Registry liest `parameter_schema` + Overlay-Hook aus)
+- [x] 0.2 Ordner `controllers/` und `workers/` anlegen
+- [x] 0.3 Test in `test/test.py`: Registry findet die alg_-Module (seit Phase 5: alg_sma) → sauberer Zustand
+- [x] 0.4 **Commit** (`playground_step1`)
 
 ### Phase 1 – Basis-UI (UI-Review durch Anwender)
-- [ ] 1.1 `TimeRangeWidget` erstellen (Von/Bis + Presets 1T/1W/1M/3M/YTD)
-- [ ] 1.2 In `main_win` unter der Top-Zeile einbauen
+- [x] 1.1 `TimeRangeWidget` erstellen (Von/Bis + Presets 1T/1W/1M/3M/YTD)
+- [x] 1.2 In `main_win` unter der Top-Zeile einbauen
 - [ ] **STOPP → UI-Review:** Zeitraum-Zeile OK? Position, Größe, Presets?
 
 ### Phase 2 – Algo-Liste + Add-Dialog (UI-Review)
-- [ ] 2.1 `AlgoPickerDialog` erstellen (Dropdown-Checkliste, Mehrfachauswahl, „Übernehmen")
-- [ ] 2.2 `QListWidget` mit Checkboxen im linken Panel + „+"-Button
-- [ ] 2.3 Kontextmenü „Entfernen" an Listeneinträgen
+- [x] 2.1 `AlgoPickerDialog` erstellen (Dropdown-Checkliste, Mehrfachauswahl, „Übernehmen")
+- [x] 2.2 `QListWidget` mit Checkboxen im linken Panel + „+"-Button
+- [x] 2.3 Kontextmenü „Entfernen" an Listeneinträgen
 - [ ] **STOPP → UI-Review:** Listenlayout, Checkbox-Interaktion, Dialog-Größe, Kontextmenü?
 
 ### Phase 3 – Parameter-Form (UI-Review)
-- [ ] 3.1 `ParamFormWidget` erstellen (generiert aus `parameter_schema`)
+- [x] 3.1 `ParamFormWidget` erstellen (generiert aus `parameter_schema`)
 - [ ] **STOPP → UI-Review:** Anordnung der Felder, SpinBoxen/Checkboxen/Typen?
 
 ### Phase 4 – Canvas-Basics (UI-Review)
-- [ ] 4.1 `PlaygroundChartService`: erstmal **nur Candlestick** + Zeitraum-Slice
-- [ ] 4.2 `QWebEngineView`-Canvas + Dark-Theme einbauen (offline plotly.js)
+- [x] 4.1 `PlaygroundChartService`: erstmal **nur Candlestick** + Zeitraum-Slice
+- [x] 4.2 `QWebEngineView`-Canvas + Dark-Theme einbauen (offline plotly.js)
 - [ ] **STOPP → UI-Review:** Canvas-Darstellung, Dark-Theme, Zoom/Sync?
 
 ### Phase 5 – Erster echter Algo (Vertrag festlegen)
-- [ ] 5.1 Beispiel-Algo `algos/alg_sma.py` mit Overlay-Hook + `parameter_schema`
-- [ ] 5.2 Overlay auf Canvas + Param-Änderung → Neuberechnung (Debounce)
-- [ ] 5.3 Overlay-Farben: erstmal automatisch (farbiger Zyklus); später je Algo einstellbar
+- [x] 5.1 Beispiel-Algo `algos/alg_sma.py` mit Overlay-Hook + `parameter_schema`
+- [x] 5.2 Overlay auf Canvas + Param-Änderung → Neuberechnung (Debounce)
+- [x] 5.3 Overlay-Farben: erstmal automatisch (farbiger Zyklus); später je Algo einstellbar
 - [ ] **STOPP → UI-Review:** Overlay-Sichtbarkeit, Parameter-Live-Update, Farbzyklus?
 
 ### Phase 6 – Integration & Härtung
@@ -165,4 +165,10 @@ main_win.py  = NUR Zusammenbau der Controls + 1 Controller-Zeile
 
 > Format: `**DD.MM.YYYY, HH:MM – <ID> <Beschreibung>**`. Einträge erfolgen erst nach expliziter Freigabe des Anwenders.
 
-- *(noch keine Einträge – Dokument ist das Konzept für den Algo-Playground)*
+- **17.08.2026, 10:56 – Phase 0** Algo-Registry (`algos/algo_registry.py`): dynamischer, defensiver Scan aller `alg_*.py`-Module; liest `parameter_schema` + Overlay-Hook; 0-Zustand sauber getestet (Commit `93f7b91`).
+- **17.08.2026, 10:59 – Phase 1** `TimeRangeWidget` (Von/Bis + Presets 1T/1W/1M/3M/YTD) in `main_win` eingebaut (Commit `6fcbdef`); UI-Feinschliff: schmale Preset-Buttons, Log/Statuszeile nach unten (Commit `3643e08`).
+- **17.08.2026, 11:07 – Phase 2** `AlgoListPanel` (QListWidget mit Checkboxen, „+"-Button, Kontextmenü „Entfernen") + `AlgoPickerDialog` (Dropdown-Checkliste, Mehrfachauswahl) (Commit `b539876`).
+- **17.08.2026, 11:11–11:23 – Phase 3** `ParamFormWidget` (Schema→Widgets, Params-Flow pro Instanz); vertikaler Splitter im linken Panel + Save/Restore aller Werte; „+" oben statt Label; Statuszeile rechts neben „+" (Commits `645d02b`, `dee3acf`, `f7b4103`, `5067822`).
+- **17.08.2026, 11:27–12:00 – Phase 4** Canvas-Basics: `PlaygroundChartService` (Candlestick + Zeitraum-Slice, Dark-Theme) + QWebEngineView-Canvas; Bugfixes (plotly.js als Datei statt Inline, Cache-Reload nach Scan, Lücken ausblenden); TradingView-Verhalten (scrollZoom/pan), Preisachse rechts, Canvas füllt gesamten Bereich (Commits `27bd3a1`–`328e9f3`).
+- **17.08.2026, 12:15 – Phase 5** Erster echter Algo + Overlays: `algos/alg_sma.py` (Definitions-Zone mit `parameter_schema` + `result_schema`, store='series'), Registry liest `result_schema`/`has_overlay`, `AlgoResultsRepository` (Persistenz in `algo_results`), Controller-Overlay-Flow (Berechnung via `get_overlay_series`, Debounce 300 ms, Checkbox-Sichtbarkeit, Farbzyklus, Zeitraum-Slice, DB-Delete bei Entfernen) (Commit `7e1a0bf`).
+  * **Verifikation:** `test/test.py` 16/16 grün (inkl. Phase-5-Tests: alg_sma-Overlay-Serie, Repository-Roundtrip in Test-DB, kompletter Controller-Overlay-Flow); `py_compile` auf allen geänderten Dateien OK.
