@@ -21,6 +21,7 @@ Nutzt die uebernommenen Bausteine:
 """
 
 import sys
+from typing import List
 
 from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtWidgets import (
@@ -37,10 +38,10 @@ from PySide6.QtWidgets import (
 
 from config.event_bus import event_bus
 from data_sync.mt5_sync_service import TF_SECONDS_MAP
+from persistent_win import PersistentWindow
 from repositories.symbol_repository import SymbolRepository, get_symbol_repository
-from serviceui.symbols_win import SymbolsWindow
 from state_manager import StateManager
-from ui.properties_win import PropertiesWindow
+from ui.window_manager import WindowManager
 from workers.data_sync_worker import DataSyncWorker
 
 # Anzeige-Reihenfolge der Timeframes (aufsteigend nach Sekunden).
@@ -82,12 +83,17 @@ class MainWin(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PyBack - MT5 Backtest Framework")
-        self.resize(1100, 640)
 
         # --- Infrastruktur -------------------------------------------------
         self.state_manager = StateManager()
         self._symbol_repo = get_symbol_repository()
         self._worker = None
+        self.persistent_sub_windows: List[PersistentWindow] = []
+        self.window_manager = WindowManager(
+            parent=self,
+            state_manager=self.state_manager,
+            persistent_sub_windows=self.persistent_sub_windows,
+        )
 
         # --- UI-Aufbau -----------------------------------------------------
         self._build_ui()
@@ -97,6 +103,12 @@ class MainWin(QMainWindow):
 
         # Favoriten-Aenderungen (SymbolsWindow) refreshen die Symbol-Combo.
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+
+        # Letzte Groesse/Position des Hauptfensters wiederherstellen.
+        self.restore_main_window_geometry()
+
+        # Gespeicherte Sub-Fenster (PropertiesWindow etc.) wiederherstellen.
+        QTimer.singleShot(200, self.window_manager.restore_all_windows)
 
         # Beim Start automatisch verbinden + sofortiges Update (nach Show).
         QTimer.singleShot(0, self.start_sync)
@@ -206,31 +218,46 @@ class MainWin(QMainWindow):
         return self.tf_combo.currentText() or DEFAULT_TIMEFRAME
 
     # ------------------------------------------------------------------
-    # Fenster-Oeffnen (nicht-modal, Singleton-Verhalten)
+    # Fenster-Oeffnen (Delegation an WindowManager, IoC)
     # ------------------------------------------------------------------
     def open_symbols_window(self) -> None:
-        """Oeffnet das nicht-modale SymbolsWindow (Favoriten-Verwaltung).
-
-        Existiert bereits eine sichtbare Instanz, wird sie in den
-        Vordergrund geholt statt neu geoeffnet (PersistentWindow-API).
-        """
-        existing = SymbolsWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = SymbolsWindow(self)  # parent nur fuer state_manager-Zugriff
-        win.show()
+        """Oeffnet das nicht-modale SymbolsWindow (Favoriten-Verwaltung)."""
+        self.window_manager.open_symbols_window()
 
     def open_properties_window(self) -> None:
         """Oeffnet das nicht-modale PropertiesWindow (Systemoptionen)."""
-        existing = PropertiesWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = PropertiesWindow(self)  # parent nur fuer state_manager-Zugriff
-        win.show()
+        self.window_manager.open_properties_window()
+
+    # ------------------------------------------------------------------
+    # Geometrie-Persistenz (win_main: letzte Groesse/Position)
+    # ------------------------------------------------------------------
+    def restore_main_window_geometry(self) -> None:
+        """Stellt die zuletzt gespeicherte Groesse/Position von win_main wieder her.
+
+        Muster aus pytrader main.py (restore_main_window_geometry): Positionen
+        ausserhalb aller Screens fallen auf (100,100) zurueck; maximierte
+        Fenster werden wieder maximiert.
+        """
+        geom = self.state_manager.get_window_geometry("win_main")
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            width = geom.get("width") or self.width()
+            height = geom.get("height") or self.height()
+
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                        pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+                self.move(pos_x, pos_y)
+                self.resize(width, height)
+
+            if geom.get("is_maximized"):
+                self.showMaximized()
+        else:
+            # Keine gespeicherte Geometrie – Standardgroesse setzen.
+            self.resize(1100, 640)
 
     # ------------------------------------------------------------------
     # Sync (Scan-Button & Auto-Start)
@@ -281,7 +308,15 @@ class MainWin(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
-        """Stellt den Original-stdout wieder her, bevor das Fenster schliesst."""
+        """Speichert Groesse/Position von win_main und stellt stdout wieder her.
+
+        Der StateManager persistiert die Geometrie unter der Instanz-ID
+        'win_main' (window_instances-Tabelle) – beim naechsten Start stellt
+        restore_main_window_geometry() sie wieder her.
+        """
+        p, s = self.pos(), self.size()
+        self.state_manager.save_window_geometry(
+            "win_main", p.x(), p.y(), s.width(), s.height(), self.isMaximized())
         sys.stdout = self._orig_stdout
         super().closeEvent(event)
 

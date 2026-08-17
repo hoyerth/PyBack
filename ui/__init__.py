@@ -1,6 +1,7 @@
 # ui/__init__.py
 """
-ui-Paket (PyBack): UI-Fenster.
+ui-Paket (PyBack): UI-Fenster & Fenster-Lifecycle.
 
-  * properties_win.py – PropertiesWindow (Systemoptionen, "Opt"-Button)
+  * window_manager.py  – WindowManager (Fenster-Lifecycle, Restore)
+  * properties_win.py  – PropertiesWindow (Systemoptionen, "Opt"-Button)
 """
