@@ -260,23 +260,34 @@ class AlgoPlaygroundController(QObject):
     # ------------------------------------------------------------------
     # Canvas (Phase 4: Candlestick + Zeitraum-Slice, Konzept 2.4)
     # ------------------------------------------------------------------
-    def refresh_chart(self) -> None:
+    def refresh_chart(self, force_reload: bool = False) -> None:
         """Laedt (falls noetig) die Daten und rendert den Canvas neu.
+
+        Args:
+            force_reload: True -> Cache verwerfen und neu aus DuckDB laden
+                (nach einem Sync, damit neue Kerzen erscheinen). False ->
+                Konzept 2.4: gleiches (Symbol, TF)-Paar nutzt den Cache.
 
         Wird vom View beim Start (nach restore_state) und nach einem
         erfolgreichen Sync aufgerufen. Symbol/TF-Wechsel invalidiert den
         Cache (Konzept 2.4: einmaliges Laden pro (Symbol, TF)-Paar).
         """
-        self._load_candles()
+        self._load_candles(force_reload=force_reload)
+        if force_reload:
+            # Nach einem Sync: sichtbaren Bereich bis zur neuesten Kerze
+            # erweitern, damit die neuen Daten auch angezeigt werden.
+            self._extend_range_to_latest()
         self._render_chart()
 
-    def _load_candles(self) -> None:
-        """Laedt OHLCV-Kerzen einmalig pro (Symbol, TF) in den Cache.
+    def _load_candles(self, force_reload: bool = False) -> None:
+        """Laedt OHLCV-Kerzen (einmalig pro (Symbol, TF) oder erzwungen).
 
         Konzept 2.4: Beim Wechsel von Symbol oder TF wird der DataFrame
         einmalig aus dem MarketDataRepository geladen und gecacht; danach
         arbeiten alle Playground-Berechnungen auf diesem Cache (kein
-        Neuladen bei Zeitraum-Aenderungen).
+        Neuladen bei Zeitraum-Aenderungen). Nach einem Scan (force_reload)
+        wird der Cache verworfen und frisch geladen (Bugfix 17.08.2026:
+        sonst blieben alte Kerzen trotz neuer DB-Daten sichtbar).
         """
         if not hasattr(self.ui, "current_symbol") or \
                 not hasattr(self.ui, "current_timeframe"):
@@ -284,7 +295,8 @@ class AlgoPlaygroundController(QObject):
         symbol = self.ui.current_symbol()
         timeframe = self.ui.current_timeframe()
         pair = (symbol, timeframe)
-        if self._last_pair == pair and self._candles_cache is not None:
+        if not force_reload and self._last_pair == pair and \
+                self._candles_cache is not None:
             return  # Cache fuer dieses Paar ist noch gueltig
 
         self._last_pair = pair
@@ -297,6 +309,24 @@ class AlgoPlaygroundController(QObject):
             self._candles_cache = None
         self.ui.status_label.setText(
             f"Status: {len(candles)} Kerzen geladen ({symbol} {timeframe})")
+
+    def _extend_range_to_latest(self) -> None:
+        """Erweitert das Bis-Datum auf die neueste Kerze (nach Sync).
+
+        Nur wenn die neueste gecachte Kerze neuer als das aktuelle Bis-Datum
+        ist. Von/Bis setzen emittiert range_changed -> _on_range_changed
+        rendert den Canvas einmal neu (keine Schleife).
+        """
+        if self._candles_cache is None or self._candles_cache.empty:
+            return
+        max_epoch = int(self._candles_cache["time"].max())
+        _, to_epoch = self.ui.time_range.get_range()
+        if max_epoch > to_epoch:
+            from datetime import datetime
+            from_epoch, _ = self.ui.time_range.get_range()
+            self.ui.time_range.set_range(
+                datetime.fromtimestamp(from_epoch),
+                datetime.fromtimestamp(max_epoch))
 
     def _on_symbol_tf_changed(self, *_args) -> None:
         """Symbol oder Timeframe geaendert: Cache invalidieren + neu rendern."""

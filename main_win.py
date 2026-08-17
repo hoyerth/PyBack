@@ -377,8 +377,10 @@ class MainWin(QMainWindow):
         self.log.appendPlainText(
             f">>> Sync abgeschlossen. Aktualisierte Paare: {count}"
         )
-        # Neue Daten koennen den Canvas fuellen (Phase 4): Cache neu laden.
-        self.playground_controller.refresh_chart()
+        # Neue Daten (Bugfix 17.08.2026): Cache MIT force_reload neu laden,
+        # sonst blieben die alten Kerzen trotz aktualisierter DB sichtbar.
+        # _extend_range_to_latest schiebt das Bis-Datum auf die neueste Kerze.
+        self.playground_controller.refresh_chart(force_reload=True)
 
     # ------------------------------------------------------------------
     def _on_worker_finished(self) -> None:
