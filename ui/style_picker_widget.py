@@ -17,18 +17,20 @@
 #   * Unterer Bereich (QFormLayout): Zeichnungsparameter (style_type='line':
 #     Linienstaerke 1-10 px + Linienart solid/dot/dash/longdash/dashdot/
 #     longdashdot; style_type='marker': Markergroesse 1-20 px + Symbol-
-#     Dropdown aus PLOTLY_SYMBOLS). Optional 'sichtbar'-Checkbox, wenn
-#     show_visibility=True.
+#     Dropdown aus PLOTLY_SYMBOLS).
 #   * QDialogButtonBox [Abbrechen] / [Übernehmen].
 # Bei color_only=True werden Trennlinie und unterer Bereich per
 # setVisible(False) ausgeblendet und der Dialog auf die reine Farbwahl
 # verkleinert.
 #
+# USER-REQ (17.08.2026): Die 'sichtbar'-Checkbox und der show-Wert wurden
+# entfernt - die Sichtbarkeit eines Overlays steuert ausschliesslich die
+# Instanz-Checkbox im Algo-Panel (AlgoListPanel).
+#
 # Fassade (wie PyTrader, damit die ParamFormWidget/Controller-Integration
 # analog bleibt):
 #   * Methoden: get_style(), set_style(obj), set_color(color_str), color()
-#   * Properties: style_type ("line"|"marker"), color_only (bool),
-#     show_visibility (bool)
+#   * Properties: style_type ("line"|"marker"), color_only (bool)
 #   * Signal: style_changed(object) - emittiert bei Uebernahme im Dialog das
 #     aktualisierte LineStyle- bzw. MarkerStyle-Objekt.
 #
@@ -45,7 +47,6 @@ from typing import Optional, Union
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -143,7 +144,6 @@ class StylePickerDialog(QDialog):
            (QComboBox: Plotly-Dash-Werte).
          * style_type='marker': Markergroesse (QSpinBox 1-20 px) +
            Symbol (QComboBox: PLOTLY_SYMBOLS).
-         * Optional 'sichtbar'-Checkbox, wenn show_visibility=True.
       4. **Buttons:** QDialogButtonBox [Abbrechen] / [Übernehmen].
 
     Bei color_only=True werden Trennlinie und unterer Bereich per
@@ -160,14 +160,12 @@ class StylePickerDialog(QDialog):
         style_type: str = "line",
         color_only: bool = False,
         enable_alpha: bool = True,
-        show_visibility: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         self._color_only: bool = bool(color_only)
         self._enable_alpha: bool = bool(enable_alpha)
-        self._show_visibility: bool = bool(show_visibility)
 
         # Arbeitskopie des Style-Objekts (Typ passend zum Modus).
         if self._style_type == "marker":
@@ -297,20 +295,14 @@ class StylePickerDialog(QDialog):
     def _build_params_widget(self) -> QWidget:
         """Unterer Bereich: Zeichnungsparameter (width|size + style|symbol).
 
-        Optional eine 'sichtbar'-Checkbox (show_visibility=True), wenn die
-        Sichtbarkeit nicht ueber einen separaten 'show_*'-Parameter laeuft.
+        USER-REQ (17.08.2026): Keine 'sichtbar'-Checkbox mehr - die
+        Sichtbarkeit eines Overlays steuert die Instanz-Checkbox im
+        Algo-Panel (AlgoListPanel).
         """
         w = QWidget()
         form = QFormLayout(w)
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(6)
-
-        self._show_check = QCheckBox("sichtbar")
-        self._show_check.setToolTip(
-            "Element anzeigen" if self._style_type == "line"
-            else "Marker anzeigen")
-        if self._show_visibility:
-            form.addRow("", self._show_check)
 
         self._param_spin = QSpinBox()
         if self._style_type == "marker":
@@ -347,22 +339,17 @@ class StylePickerDialog(QDialog):
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuell im Dialog eingestellten Stil als NEUES Objekt.
 
-        Beruecksichtigt Farbe (inkl. Transparenz), width|size und style|symbol
-        sowie - falls show_visibility=True - den Zustand der
-        'sichtbar'-Checkbox.
+        Beruecksichtigt Farbe (inkl. Transparenz) sowie width|size und
+        style|symbol.
         """
-        show = (self._show_check.isChecked()
-                if self._show_visibility else bool(self._style.show))
         if self._style_type == "marker":
             return MarkerStyle(
-                show=show,
                 color=self._color_str(),
                 symbol=str(self._param_combo.currentData())
                        or "circle",
                 size=int(self._param_spin.value()),
             )
         return LineStyle(
-            show=show,
             color=self._color_str(),
             width=int(self._param_spin.value()),
             style=str(self._param_combo.currentData()) or "solid",
@@ -377,12 +364,10 @@ class StylePickerDialog(QDialog):
     ) -> None:
         """Uebernimmt ein Style-Objekt in die Dialog-Controls."""
         if self._style_type == "marker" and isinstance(style, MarkerStyle):
-            self._show_check.setChecked(bool(style.show))
             self._param_spin.setValue(int(style.size))
             self._set_combo_data(self._param_combo, style.symbol,
                                  PLOTLY_SYMBOLS, "circle")
         elif self._style_type == "line" and isinstance(style, LineStyle):
-            self._show_check.setChecked(bool(style.show))
             self._param_spin.setValue(int(style.width))
             self._set_combo_data(self._param_combo, style.style,
                                  LINE_STYLES, "solid")
@@ -464,7 +449,7 @@ class StylePickerWidget(QWidget):
     emittiert.
 
     Fassade (wie PyTrader): get_style()/set_style()/set_color()/color(),
-    Properties style_type/color_only/show_visibility, Signal style_changed.
+    Properties style_type/color_only, Signal style_changed.
     """
 
     style_changed = Signal(object)
@@ -480,12 +465,10 @@ class StylePickerWidget(QWidget):
         parent=None,
         style_type: str = "line",
         color_only: bool = False,
-        show_visibility: bool = True,
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
         self._color_only: bool = bool(color_only)
-        self._show_visibility: bool = bool(show_visibility)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         if self._style_type == "marker":
             self._style: MarkerStyle = (
@@ -533,11 +516,6 @@ class StylePickerWidget(QWidget):
         """True = reiner Farbwaehler (Dialog zeigt nur den Farbbereich)."""
         return self._color_only
 
-    @property
-    def show_visibility(self) -> bool:
-        """True = Dialog zeigt eine 'sichtbar'-Checkbox (Default)."""
-        return self._show_visibility
-
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei
         style_type='line', MarkerStyle bei style_type='marker').
@@ -547,13 +525,11 @@ class StylePickerWidget(QWidget):
         """
         if self._style_type == "marker":
             return MarkerStyle(
-                show=bool(self._style.show),
                 color=self._color_button_value(),
                 symbol=str(self._style.symbol),
                 size=int(self._style.size),
             )
         return LineStyle(
-            show=bool(self._style.show),
             color=self._color_button_value(),
             width=int(self._style.width),
             style=str(self._style.style),
@@ -572,7 +548,7 @@ class StylePickerWidget(QWidget):
         self._update_swatch()
 
     def set_color(self, color_str: str) -> None:
-        """Setzt ausschliesslich die Farbe (behaelt show/width|size/style|symbol)."""
+        """Setzt ausschliesslich die Farbe (behaelt width|size/style|symbol)."""
         self._set_color_internal(color_str)
 
     def color(self) -> str:
@@ -589,7 +565,7 @@ class StylePickerWidget(QWidget):
         dlg = StylePickerDialog(
             self.get_style(), style_type=self._style_type,
             color_only=self._color_only, enable_alpha=self._enable_alpha,
-            show_visibility=self._show_visibility, parent=self)
+            parent=self)
         if dlg.exec() == QDialog.Accepted:
             new_style = dlg.get_style()
             self._style = new_style

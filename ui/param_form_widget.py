@@ -213,9 +213,10 @@ class ParamFormWidget(QWidget):
         if ctype == "color":
             # Phase 7: StylePickerWidget (Button -> Dialog) - Farbe plus
             # Linienart/Staerke (line) bzw. Symbol/Groesse (marker).
+            # USER-REQ (17.08.2026): Keine 'sichtbar'-Checkbox mehr - die
+            # Sichtbarkeit steuert die Instanz-Checkbox im Algo-Panel.
             style_type = str(spec.get("style_type", "line"))
             color_only = bool(spec.get("color_only", False))
-            show_visibility = bool(spec.get("show_visibility", True))
             allow_alpha = bool(spec.get("allow_alpha", True))
             color = str(default) if default else "#ff7f0e"
             if style_type == "marker":
@@ -224,8 +225,7 @@ class ParamFormWidget(QWidget):
                 style_obj = LineStyle(color=color)
             widget: QWidget = StylePickerWidget(
                 style=style_obj, style_type=style_type,
-                color_only=color_only, show_visibility=show_visibility,
-                enable_alpha=allow_alpha)
+                color_only=color_only, enable_alpha=allow_alpha)
         elif ctype == "bool":
             widget = QCheckBox()
             widget.setChecked(bool(default))

@@ -168,3 +168,53 @@ p.maximum/np.minimum.reduceat (Bucket-Zeit = erste Kerze, Standard-Aggregationsk
 
 * `test/check_measurement.py` – **OK**: Messbox sichtbar, Messtext vollstaendig (`Δ Preis: -4.43% (-3.047)`, `Δ Zeit: 317 Bars · 10:13:00`, Start/Ende korrekt), Escape-Clear funktioniert.
 * `py_compile ui/playground_chart_service.py` OK.
+
+---
+
+## Implementierungs-Log: Style-Picker – `show`-Wert & 'sichtbar'-Checkbox entfernt (17.08.2026, 18:16)
+
+> **USER-REQ:** „Aus dem Style-Picker Wert und Checkbox 'visible' entfernen" – umgesetzt in Variante (b): `show` komplett entfernt (nicht nur ausgeblendet). Sichtbarkeit eines Overlays steuert ausschliesslich die Instanz-Checkbox im Algo-Panel (`AlgoListPanel`); der Controller/Render nutzte `show` nie (Analyse bestaetigt).
+
+### Aenderungen
+
+| Datei | Inhalt |
+|-------|--------|
+| `ui/style_models.py` | `LineStyle`/`MarkerStyle`: Feld `show` entfernt; `to_dict()` liefert kein `"show"` mehr; `from_dict()` liest es nicht mehr (tolerant: alte gespeicherte States mit `show` bleiben ladbar, Feld wird ignoriert – Abwaertskompatibilitaet). Ungenutzter `_as_bool`-Helper entfernt. |
+| `ui/style_picker_widget.py` | `StylePickerDialog` + `StylePickerWidget`: Parameter `show_visibility`, Property `show_visibility`, Attribut `_show_visibility` und Checkbox `_show_check` ('sichtbar') komplett entfernt; `get_style()`/`_apply_style_to_ui()` ohne `show`-Logik; `_open_picker_dialog()` reicht kein `show_visibility` mehr durch; ungenutzter `QCheckBox`-Import entfernt. |
+| `ui/param_form_widget.py` | `show_visibility = spec.get("show_visibility", True)`-Durchreichung an den StylePicker entfernt. |
+
+### Verifikation (headless, keine UI)
+
+* `py_compile` auf allen 3 Dateien OK.
+* Keine Rest-Referenzen auf `show_visibility` / `_show_check` / `style.show` / `_as_bool` im Projekt (excl. `docs/`).
+* `test/test.py` → `test_phase7_style_picker` **OK** (to_dict/from_dict-Roundtrip, StylePickerWidget, ParamFormWidget, Controller, Persistenz).
+* Zusatz-Check: `to_dict()` enthaelt kein `show`, keine `show_visibility`-API mehr vorhanden – **OK**.
+
+---
+
+## Angefordert (geplant, NICHT umgesetzt): MA-Algo aus PyTrader (17.08.2026, 18:16)
+
+> **USER-REQ (Zielbild, Implementierung wartet auf ausdruecklichen Startschuss):** MA-Indikator aus PyTrader pruefen und als Algo einbauen – **EIN MA-Wert** (nicht 8 wie PyTrader `ind_moving_averages`). Nachfolgend die finalen Vorgaben des Anwenders.
+
+### Anforderung (final, 17.08.2026)
+
+1. **Defaults wie PyTrader:** `ma_type=EHMA`, `period=4`, `smoothing=10`, `alpha_factor=2.0`.
+2. **Preisquelle:** nur `close` (KEIN `use_close`-Schalter / kein H+L+C/3).
+3. **Zusaetzlich uebernehmen (dual_color-Semantik aus PyTrader MA1):**
+   a. Checkbox **aufsteigend/absteigend verschiedene Farben** (`dual_color`): MA t >= t-1 -> bull-Farbe, sonst bear-Farbe.
+   b. Die beiden Farbfelder mit **Vorgabe Gruen/Rot** (bull_color default gruen, bear_color default rot).
+4. Sonst: `parameter_schema` als PineScript-Input-Zone am Dateianfang; `result_schema = {"ma": {"type": "float", "store": "series"}}`; `get_overlay_series(candles_df) -> dict` mit Index = `candles_df["time"]` (Epoch-Int, Wanduhr); StylePicker-Keys `line_color`/`line_style`/`line_width` (PyBack-Plotly-Dash-Werte, NICHT PyTrader-LWC-Werte).
+
+### Bausteine (Quelle, bewertet)
+
+* `F:\Python\PyTrader\chart\indicators\utils\ma_template.py` – `MATemplateEngine.calculate_ma` (12 MA-Typen, vektorisiert) wirtschaftlich uebernehmbar; **ohne** `build_chart_payload` (LWC-spezifisch). `build_color_series`/`resolve_bull_color` werden fuer die dual_color-Semantik benoetigt (Farbe je Punkt).
+* `candles_df` enthaelt `tick_volume` (Repository, NaN->0) → VWMA funktioniert ohne DB-Aenderung.
+
+### Offen (vor/nach Freigabe)
+
+* **Render der dual_color-Linie in PyBack (Plotly):** PyBack rendert Overlays als EIN durchgehender Trace (eine Farbe via `_style_for_instance`). Fuer bull/bear-Segmente ist ein Segment-Ansatz (mehrere Traces je Farbblock oder Marker-Farbe je Punkt) noetig – Detail-Entscheidung bei der Umsetzung.
+
+### Status
+
+* Keine Dateien angelegt (`algos/alg_ma.py`, `algos/ma_utils.py` existieren nicht). Kein Commit fuer Punkt 2.
+* **Wartet auf ausdruecklichen Anwender-Befehl ("nicht coden, warte auf meinen befehl").**

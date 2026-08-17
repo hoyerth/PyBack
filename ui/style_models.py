@@ -7,9 +7,13 @@
 # flache Einzelparameter (line_color, line_width, ...) durch das System
 # gereicht, sondern in typisierten Styling-Klassen gebuendelt:
 #
-#   * LineStyle   - Linien: show / color / width / style
+#   * LineStyle   - Linien: color / width / style
 #   * MarkerStyle - Marker/Symbole (falls nicht als Linie definiert):
-#                   show / color / symbol / size
+#                   color / symbol / size
+#
+# USER-REQ (17.08.2026): Der `show`-Wert und die 'sichtbar'-Checkbox wurden
+# entfernt - die Sichtbarkeit eines Overlays steuert ausschliesslich die
+# Instanz-Checkbox im Algo-Panel (AlgoListPanel), nicht der StylePicker.
 #
 # Konvertierungen:
 #   * to_dict()     - JSON-kompatibles Dict (Persistenz in instance_params
@@ -31,14 +35,6 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 # Konvertierungs-Helfer
 # ---------------------------------------------------------------------------
-
-def _as_bool(value: Any, default: bool = True) -> bool:
-    if isinstance(value, str):
-        return value.lower() in ("true", "1", "yes")
-    if value is None:
-        return default
-    return bool(value)
-
 
 def _as_int(value: Any, default: int) -> int:
     try:
@@ -116,17 +112,19 @@ LINE_STYLE_LABELS: Dict[str, str] = {
 
 @dataclass
 class LineStyle:
-    """Stil-Definition fuer Linien: Sichtbarkeit, Farbe, Staerke, Linienart.
+    """Stil-Definition fuer Linien: Farbe, Staerke, Linienart.
+
+    USER-REQ (17.08.2026): `show` entfernt - die Sichtbarkeit eines
+    Overlays steuert die Instanz-Checkbox im Algo-Panel (AlgoListPanel),
+    nicht mehr der StylePicker.
 
     Attributes:
-        show:  bool  – Linie sichtbar (QCheckBox im StylePickerDialog).
         color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
         width: int   – Linienstaerke in px (1–10, QSpinBox).
         style: str   – Plotly-Dash-Wert: 'solid'|'dot'|'dash'|'longdash'|
                        'dashdot'|'longdashdot' (QComboBox).
     """
 
-    show: bool = True
     color: str = "#ff7f0e"
     width: int = 2
     style: str = "solid"
@@ -145,7 +143,6 @@ class LineStyle:
     def to_dict(self) -> Dict[str, Any]:
         """JSON-kompatibles Dict (instance_params / playground_state)."""
         return {
-            "show": bool(self.show),
             "color": str(self.color),
             "width": int(self.width),
             "style": str(self.style) if str(self.style) in LINE_STYLES else "solid",
@@ -163,7 +160,6 @@ class LineStyle:
         if style not in LINE_STYLES:
             style = "solid"
         return cls(
-            show=_as_bool(data.get("show"), True),
             color=_as_str(data.get("color"), "#ff7f0e"),
             width=_as_int(data.get("width"), 2),
             style=style,
@@ -220,19 +216,21 @@ SYMBOL_LABELS: Dict[str, str] = {
 
 @dataclass
 class MarkerStyle:
-    """Stil-Definition fuer Marker/Punkte: Sichtbarkeit, Farbe, Symbol, Groesse.
+    """Stil-Definition fuer Marker/Punkte: Farbe, Symbol, Groesse.
 
     Wird verwendet, wenn ein Algo NICHT als Linie definiert ist
     (result_schema render != 'line', z. B. store='agg' mit Markern).
 
+    USER-REQ (17.08.2026): `show` entfernt - die Sichtbarkeit eines
+    Overlays steuert die Instanz-Checkbox im Algo-Panel (AlgoListPanel),
+    nicht mehr der StylePicker.
+
     Attributes:
-        show:  bool  – Marker sichtbar (QCheckBox).
         color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
         symbol: str  – Plotly-Symbol aus PLOTLY_SYMBOLS (QComboBox).
         size:  int   – Markergroesse in px (QSpinBox).
     """
 
-    show: bool = True
     color: str = "#ff7f0e"
     symbol: str = "circle"
     size: int = 6
@@ -251,7 +249,6 @@ class MarkerStyle:
     def to_dict(self) -> Dict[str, Any]:
         """JSON-kompatibles Dict (instance_params / playground_state)."""
         return {
-            "show": bool(self.show),
             "color": str(self.color),
             "symbol": str(self.symbol) if str(self.symbol) in PLOTLY_SYMBOLS else "circle",
             "size": int(self.size),
@@ -269,7 +266,6 @@ class MarkerStyle:
         if symbol not in PLOTLY_SYMBOLS:
             symbol = "circle"
         return cls(
-            show=_as_bool(data.get("show"), True),
             color=_as_str(data.get("color"), "#ff7f0e"),
             symbol=symbol,
             size=_as_int(data.get("size"), 6),
