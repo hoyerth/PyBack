@@ -309,10 +309,9 @@ class AlgoPlaygroundController(QObject):
         self._view_timer.setInterval(500)
         self._view_timer.timeout.connect(self._poll_view)
         self._view_timer.start()
-        # Reihenfolge der AKTUELL im Canvas sichtbaren Overlay-Traces
-        # (Phase 6, USER-REQ: kein Neuaufbau beim Check/Uncheck). Der
-        # Candlestick-Trace liegt immer auf Index 0 -> Overlay-Index =
-        # 1 + Position in dieser Liste (Trace-Key = "instance_key::name").
+        # Reihenfolge der AKTUELL in der Figur sichtbaren Overlay-Traces
+        # (wird bei jedem _render_chart neu gesetzt; Dokumentation der
+        # Trace-Reihenfolge hinter dem Candlestick auf Index 0).
         self._overlay_order: List[str] = []
         # Debounce (300ms, Konzept 2.2): nur der betroffene Algo wird
         # nach Parameter-Aenderung neu berechnet (kurze Wartezeit, damit
@@ -413,13 +412,10 @@ class AlgoPlaygroundController(QObject):
                 f"(unsichtbar – Checkbox aktivieren)")
             # Kein Canvas-Neuaufbau noetig: die Instanz ist UNCHECKED und
             # zeichnet nichts – sichtbar wird sie erst per Checkbox (dann
-            # inkrementell via Plotly.addTraces, Phase 6).
+            # robust via _render_chart/Plotly.react, Bugfix 17.08.2026).
 
     def _on_algo_removed(self, algo_id: str, instance_key: str) -> None:
         """Kontextmenue 'Entfernen': Zustand nachfuehren (RAM-only)."""
-        # Sichtbare Overlay-Traces der Instanz zuerst entfernen (inkrementell,
-        # KEIN Canvas-Neuaufbau).
-        self._remove_overlay_traces(instance_key)
         # Parameter/Overlay/Farbe der entfernten Instanz verwerfen.
         self.instance_params.pop(instance_key, None)
         self._overlays.pop(instance_key, None)
@@ -430,26 +426,35 @@ class AlgoPlaygroundController(QObject):
             self.selected_instance = None
             self.ui.param_form.set_schema({})
         self.active_algos = list(self.ui.algo_panel.algo_ids())
+        # Bugfix 17.08.2026 (SMA-Overlay-Regression): Die Figur wird per
+        # Plotly.react neu gerendert – sie enthaelt die Overlays der
+        # verbleibenden Instanzen (kein setHtml, Zoom bleibt via
+        # _pending_view). Der fruehere inkrementelle deleteTraces-Pfad
+        # verlor das Overlay still, wenn die Seite nicht bereit war.
+        self._render_chart(preserve_view=True)
         self.ui.status_label.setText(
             f"Status: {algo_id} entfernt (aktiv: {len(self.active_algos)})")
 
     def _on_visibility_changed(self, algo_id: str, instance_key: str,
                                checked: bool) -> None:
-        """Checkbox geaendert: Overlay INKREMENTELL ein/ausblenden.
+        """Checkbox geaendert: Overlay ein/aus (robust via Plotly.react).
 
-        USER-REQ (17.08.2026): kein kompletter Canvas-Neuaufbau. An statt
-        setHtml wird nur der/die Overlay-Trace(s) der Instanz per
-        Plotly.addTraces/deleteTraces hinzugefuegt/entfernt – der aktuelle
-        Zoom und alle anderen Traces bleiben unveraendert.
+        USER-REQ (17.08.2026): kein kompletter Canvas-Neuaufbau – KEIN
+        setHtml/kein Seiten-Reload. Die Figur wird per Plotly.react()
+        aktualisiert und enthaelt exakt die sichtbaren Overlay-Traces;
+        der aktuelle Zoom bleibt via _pending_view (Phase 6) erhalten.
+
+        Bugfix 17.08.2026 (SMA-Overlay-Regression): Der fruehere
+        inkrementelle Pfad (Plotly.addTraces/deleteTraces) verlor Overlays
+        still, wenn das Worker-Ergebnis vor dem Seiten-Load eintraf
+        (gd=null / Plotly undefined). Der react-Pfad ist gegen diese Race
+        robust: die Figur enthaelt die Overlays IMMER im Figure-Dict,
+        unabhaengig vom JS-Seiten-Zustand.
         """
         state = "ein" if checked else "aus"
         self.ui.status_label.setText(
             f"Status: {algo_id} Darstellung {state}")
-        if checked:
-            for t in self._build_instance_traces(instance_key):
-                self._add_overlay_trace(t)
-        else:
-            self._remove_overlay_traces(instance_key)
+        self._render_chart(preserve_view=True)
 
     def _on_algo_selected(self, algo_id: str, instance_key: str) -> None:
         """Eintrag angeklickt: Parameter-Form mit Schema + Werten befuellen."""
@@ -828,8 +833,8 @@ class AlgoPlaygroundController(QObject):
         if hasattr(self.ui, "algo_panel"):
             checked = self.ui.algo_panel.checked_states()
         overlays = self._build_overlay_traces(checked)
-        # Reihenfolge der sichtbaren Overlay-Traces merken: fuer spaetere
-        # inkrementelle Aenderungen per JS (Trace-Index = 1 + Position).
+        # Reihenfolge der sichtbaren Overlay-Traces merken (Doku der
+        # Trace-Reihenfolge hinter dem Candlestick auf Index 0).
         self._overlay_order = [t["key"] for t in overlays]
 
         # Der gespeicherte View (Zoom/Skala) wird direkt als Achsen-Range in
@@ -915,12 +920,18 @@ class AlgoPlaygroundController(QObject):
         eintraf und deren addTraces gegen die noch ladende Seite (gd=null)
         still verloren ging. _render_chart nutzt mit _page_ready=True den
         react-Pfad -> kein zweiter setHtml, keine Schleife.
+
+        Bugfix 17.08.2026 (Reload-Schleife): Ein ok=False (abgebrochener
+        Load, z. B. setHtml-Abloesung des Platzhalters) darf _page_ready
+        NICHT zuruecksetzen – sonst wuerde der naechste Render die Shell
+        erneut per setHtml laden (Reload-Schleife) und Overlay-JS wieder in
+        die ladende Seite laufen.
         """
         if not self._shell_set:
             return  # kein Shell-Load (z. B. Platzhalter oder _EMPTY_HTML)
-        self._page_ready = bool(ok)
-        if not self._page_ready:
-            return
+        if not ok:
+            return  # abgebrochener/interrupted Load ignoriert (kein Downgrade)
+        self._page_ready = True
         self._render_chart(preserve_view=False)
 
     # ------------------------------------------------------------------
@@ -992,30 +1003,6 @@ class AlgoPlaygroundController(QObject):
             print(f"WARN [Playground] runJavaScript fehlgeschlagen: {exc}")
         return False
 
-    def _add_overlay_trace(self, trace: dict) -> None:
-        """Fuegt einen Overlay-Trace per Plotly.addTraces hinzu (inkrementell)."""
-        if not self._run_js(_js_add_overlay(trace)):
-            return
-        self._overlay_order.append(trace["key"])
-
-    def _remove_overlay_traces(self, instance_key: str) -> None:
-        """Entfernt alle Overlay-Traces einer Instanz per deleteTraces."""
-        for k in [k for k in self._overlay_order
-                  if k.startswith(instance_key + "::")]:
-            idx = 1 + self._overlay_order.index(k)
-            self._run_js(_js_remove_overlay(idx))
-            self._overlay_order.remove(k)
-
-    def _update_overlay_traces(self, instance_key: str) -> None:
-        """Aktualisiert sichtbare Overlay-Traces einer Instanz (Param-Change).
-
-        Entfernt und fuegt die Traces neu hinzu – die Daten (x/y) haben sich
-        geaendert; der Canvas wird dabei NICHT neu aufgebaut.
-        """
-        self._remove_overlay_traces(instance_key)
-        for t in self._build_instance_traces(instance_key):
-            self._add_overlay_trace(t)
-
     # ------------------------------------------------------------------
     # Phase 5: Overlays (Berechnung, Farben, DB-Persistenz, Debounce)
     # ------------------------------------------------------------------
@@ -1024,9 +1011,9 @@ class AlgoPlaygroundController(QObject):
 
         Phase 6.1: Die Berechnung startet einen PlaygroundWorker (QThread)
         statt im UI-Thread zu rechnen. Sobald das Ergebnis eintrifft
-        (_on_overlay_computed), werden sichtbare Overlays INKREMENTELL per
-        JS aktualisiert (kein Canvas-Neuaufbau) – der Zoom und die anderen
-        Traces bleiben erhalten.
+        (_on_overlay_computed), wird die Figur per Plotly.react neu
+        gerendert (kein Canvas-Neuaufbau, Zoom bleibt) – der Zoom und die
+        anderen Traces bleiben erhalten.
         """
         if self._pending_recalc is None:
             return
@@ -1054,9 +1041,10 @@ class AlgoPlaygroundController(QObject):
         Phase 6.1: Die Berechnung (get_overlay_series) laeuft in einem
         PlaygroundWorker (QThread) statt im UI-Thread. Das Ergebnis kommt
         asynchron via Signal zurueck (_on_overlay_computed) und wird dort
-        gespeichert und ggf. per JS sichtbar gemacht. Eine Generationsnummer
-        pro Instanz verwirft veraltete Ergebnisse (z. B. bei schnellen
-        Parameter-Aenderungen oder Daten-Neuladen).
+        gespeichert und ggf. per Plotly.react sichtbar gemacht (kein
+        setHtml, Zoom bleibt). Eine Generationsnummer pro Instanz verwirft
+        veraltete Ergebnisse (z. B. bei schnellen Parameter-Aenderungen
+        oder Daten-Neuladen).
 
         USER-REQ (17.08.2026): NUR RAM-Berechnung + Plot – KEINE DB-
         Persistenz (AlgoResultsRepository folgt in einer spaeteren Phase).
@@ -1110,19 +1098,27 @@ class AlgoPlaygroundController(QObject):
 
         Wirft veraltete Ergebnisse ab (Generationsnummer ungleich aktueller
         Auftrag oder Instanz inzwischen entfernt). Sichtbare Overlays werden
-        INKREMENTELL per JS aktualisiert (kein Canvas-Neuaufbau).
+        per Plotly.react gerendert.
+
+        Bugfix 17.08.2026 (SMA-Overlay-Regression): Der fruehere
+        inkrementelle Pfad (addTraces per JS) verlor das Overlay still,
+        wenn das Worker-Ergebnis vor dem Seiten-Load eintraf (gd=null /
+        Plotly undefined). _render_chart(preserve_view=True) baut die Figur
+        mit den Overlays IM Figure-Dict und wendet sie per react an
+        (kein setHtml, Zoom bleibt via _pending_view) – unabhaengig vom
+        JS-Seiten-Zustand zuverlaessig.
         """
         if self._overlay_generation.get(instance_key) != generation:
             return  # veraltet (Param/Instanz inzwischen geaendert)
         if instance_key not in self.ui.algo_panel.instance_keys():
             return  # Instanz wurde inzwischen entfernt
         self._overlays[instance_key] = dict(series)
-        # Sichtbar? -> Traces der Instanz per JS aktualisieren (nur RAM).
+        # Sichtbar? -> Figur neu rendern (Overlays im Figure-Dict, RAM-only).
         checked: Dict[str, bool] = {}
         if hasattr(self.ui, "algo_panel"):
             checked = self.ui.algo_panel.checked_states()
         if checked.get(instance_key, True) is not False:
-            self._update_overlay_traces(instance_key)
+            self._render_chart(preserve_view=True)
             self.ui.status_label.setText("Status: Parameter angewendet")
 
     def _on_overlay_failed(self, generation: int, instance_key: str,
@@ -1198,8 +1194,9 @@ class AlgoPlaygroundController(QObject):
         """Baut die Overlay-Trace-Dicts EINER Instanz (Zeitraum-Slice).
 
         Pro Ergebnis-Feld der Instanz ein Trace mit eindeutigem "key"
-        ("instance_key::name") – wird fuer den initialen HTML-Render und die
-        inkrementellen JS-Aenderungen (add/remove/update) verwendet.
+        ("instance_key::name") – wird fuer die Plotly-Figur des
+        PlaygroundChartService verwendet (Figure-Render, Bugfix 17.08.2026:
+        Overlays stecken im Figure-Dict, kein fragiles addTraces-JS).
         Phase 7: Farbe/Linienart/Staerke/Symbol kommen aus den Stil-Params
         der Instanz; der Render-Modus aus dem result_schema.
         """
