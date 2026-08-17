@@ -35,11 +35,13 @@ Der Controller kennt main_win NICHT als Modul – er erhaelt das View-Objekt
 (duck-typed) ueber den Konstruktor.
 """
 
+import datetime
 import json
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtWidgets import QApplication, QDialog
@@ -55,11 +57,10 @@ from workers.playground_worker import PlaygroundWorker
 # wird in global_settings abgelegt (save_global_value/get_global_value).
 PLAYGROUND_STATE_KEY = "playground_state"
 
-# Marker des leeren Canvas-HTML (_EMPTY_HTML in playground_chart_service):
-# ein Render OHNE Kerzen darf den _pending_view nicht konsumieren – der
-# gespeicherte View gilt fuer den naechsten Render MIT Daten (Bugfix
-# 17.08.2026: set_range vor dem ersten Daten-Render verwirft den Restore-
-# View nicht mehr).
+# Marker des leeren Canvas-HTML (_EMPTY_HTML in playground_chart_service).
+# P0#1: Seit dem Figure-basierten Render prueft der Controller den leeren
+# Zustand ueber `figure is None` (statt den Marker im HTML zu suchen) –
+# die Konstante bleibt als Referenz auf den Text des Hinweis-HTML erhalten.
 _EMPTY_MARKER = "Keine Daten"
 
 # Phase 6: JS-Snippet zum Auslesen des aktuellen Plotly-Views (Zoom/Skala).
@@ -91,6 +92,58 @@ _JS_READ_VIEW = """
 """
 
 
+def _epochs_to_iso(epochs) -> List[str]:
+    """Vektorisiert Epoch-Ints -> Wanduhr-ISO-Strings (P0#3, 302ms -> ~19ms).
+
+    Formt Epoch-Zahlen (Wanduhr-encoded) in "YYYY-MM-DDTHH:MM:SS"-Strings um
+    (exakt das Format der Chart-Figur/_JS_READ_VIEW – plotly parst beide als
+    lokale Zeit, daher konsistent mit den Kerzen).
+    """
+    arr = np.asarray(list(epochs), dtype="int64")
+    if arr.size == 0:
+        return []
+    return pd.to_datetime(arr, unit="s").strftime(
+        "%Y-%m-%dT%H:%M:%S").tolist()
+
+
+class _NumpyJSONEncoder(json.JSONEncoder):
+    """JSON-Encoder fuer Figure-Dicts (numpy/Timestamp-sicher, P0#1)."""
+
+    def default(self, o: Any) -> Any:
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, np.datetime64):
+            return str(o)
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating,)):
+            return float(o)
+        if isinstance(o, (pd.Timestamp, datetime.datetime)):
+            return o.strftime("%Y-%m-%dT%H:%M:%S")
+        return super().default(o)
+
+
+def _fig_to_json(figure: dict) -> str:
+    """Serialisiert ein Figure-Dict (data/layout/config) zu JSON (P0#1)."""
+    return json.dumps(figure, cls=_NumpyJSONEncoder)
+
+
+def _js_apply_figure(fig_json: str) -> str:
+    """Baut JS zum Aktualisieren des Charts per Plotly.react (P0#1).
+
+    Aktualisiert NUR den Chart auf der BEREITS GELADENEN Page-Shell
+    (festes Div _CHART_DIV_ID) – kein setHtml/Seiten-Reload, Zoom/Pan und
+    die plotly.min.js bleiben erhalten. Plotly.react diffed data/layout und
+    rendert nur die Aenderungen (0,5–2s Seiten-Reload -> ~50–150ms).
+    """
+    return (
+        "(function(){var gd=document.getElementById('pg-chart');"
+        "if(!gd||typeof Plotly==='undefined')return;"
+        "var fig=" + fig_json + ";"
+        "Plotly.react(gd,fig.data,fig.layout,fig.config);})()"
+    )
+
+
 def _js_add_overlay(trace: dict) -> str:
     """Baut JS zum inkrementellen Hinzufuegen eines Overlay-Trace.
 
@@ -99,8 +152,10 @@ def _js_add_overlay(trace: dict) -> str:
     x-Epochs werden in Datums-Strings umgewandelt (Datumsachse).
     Phase 7: Stil-Attribute (dash/width/symbol/size/render) werden wie im
     HTML-Render gesetzt.
+    P0#3 (Optimierung): Datums-Konvertierung VEKTORISIERT (302 ms -> ~19 ms
+    bei 5000 Punkten) statt Element-Schleife.
     """
-    x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
+    x_iso = _epochs_to_iso(trace["x"])
     mode = str(trace.get("render", "line"))
     if mode not in ("line", "lines+markers", "markers"):
         mode = "line"
@@ -142,8 +197,11 @@ def _js_remove_overlay(idx: int) -> str:
 
 
 def _js_update_overlay(idx: int, trace: dict) -> str:
-    """Baut JS zum Aktualisieren eines Overlay-Trace per Index (restyle)."""
-    x_iso = [str(pd.to_datetime(int(t), unit="s")) for t in trace["x"]]
+    """Baut JS zum Aktualisieren eines Overlay-Trace per Index (restyle).
+
+    P0#3: Datums-Konvertierung vektorisiert (siehe _js_add_overlay).
+    """
+    x_iso = _epochs_to_iso(trace["x"])
     payload: dict = {"x": x_iso, "y": trace.get("y", [])}
     if trace.get("render") in ("line", "lines+markers"):
         line = {"width": float(trace.get("width", 1.5))}
@@ -166,8 +224,20 @@ def _js_update_overlay(idx: int, trace: dict) -> str:
 class AlgoPlaygroundController(QObject):
     """Presenter des Algo-Playgrounds (Phase 2-4: Liste, Dialog, Params, Canvas)."""
 
-    # Maximale Kerzenzahl beim einmaligen Laden aus DuckDB (Konzept 2.4).
-    CANDLE_LIMIT = 5000
+    # P1#5 (Optimierung): Obergrenze des RAM-Caches pro (Symbol, TF)-Paar.
+    # Der Cache wird ZEITRAUM-basiert geladen (statt "letzte 5000") – die
+    # Grenze schuetzt nur den Speicher bei sehr grossen Zeitraeumen
+    # (z. B. YTD/M1 ~320k Kerzen -> letzte 200k reichen fuer den sichtbaren
+    # Bereich + LOD-Render).
+    MAX_CACHE_CANDLES = 200_000
+    # Panning-Margin beim Laden (Anteil des Zeitraums je Seite): kleine
+    # Zeitraum-Verschiebungen innerhalb des Puffers laden NICHT neu.
+    CACHE_MARGIN_RATIO = 0.15
+    # P0#2: LOD-Grenze fuer Overlay-Serien (Rendering-Punkte je Trace).
+    LOD_MAX_OVERLAY_POINTS = 1200
+    # P2#10: nach dieser Idle-Zeit (s) pollen wir den Plotly-View nicht mehr
+    # periodisch (nur bei Interaktion lesen; save_state liest explizit).
+    VIEW_POLL_IDLE_S = 5.0
 
     def __init__(self, view) -> None:
         super().__init__()
@@ -183,6 +253,11 @@ class AlgoPlaygroundController(QObject):
         # Phase 4: Daten-Cache (Konzept 2.4) + Chart-Service + Repository.
         self._candles_cache: Optional[pd.DataFrame] = None
         self._last_pair: Optional[Tuple[str, str]] = None
+        # P1#5 (Optimierung): tatsaechliche Daten-Grenzen des Caches
+        # (min/max der 'time'-Spalte) – Grundlage der Zeitraum-Abdeckung
+        # (_cache_covers, kein Reload bei kleinen Verschiebungen).
+        self._cache_from: Optional[int] = None
+        self._cache_to: Optional[int] = None
         # Bugfix 17.08.2026 (Datums-Persistenz): Max-Epoch des KACHES VOR dem
         # letzten (force-)Reload. _extend_range_to_latest erweitert das Bis-
         # Datum NUR, wenn der Anwender vorher schon am Datumsrand war – ein
@@ -205,6 +280,16 @@ class AlgoPlaygroundController(QObject):
         # in save_state genutzt, damit beim Schliessen KEIN JS mehr laufen
         # muss (QEventLoop waehrend closeEvent ist unzuverlaessig).
         self._last_view: Optional[dict] = None
+        # P2#10 (Optimierung): Zeitpunkt der letzten Interaktion – der
+        # View-Timer pollt nur noch 5s nach einer Interaktion (sonst Idle-
+        # Skip; save_state liest beim Schliessen explizit + 300ms Event-Pump).
+        self._last_interaction: float = time.monotonic()
+        # P0#1 (Optimierung): Zustand der Page-Shell (setHtml nur 1x, alle
+        # Folge-Render per Plotly.react auf der geladenen Seite).
+        self._shell_set: bool = False
+        self._page_ready: bool = False
+        self._pending_figure_json: Optional[str] = None
+        self._pending_empty: bool = False
         # Bugfix 17.08.2026 (View-Persistenz): 500ms statt 2s – der Zoom
         # ist damit max. 0.5s alt, wenn save_state gelesen wird.
         self._view_timer = QTimer(self)
@@ -260,6 +345,26 @@ class AlgoPlaygroundController(QObject):
         tr = getattr(self.ui, "time_range", None)
         if tr is not None:
             tr.range_changed.connect(self._on_range_changed)
+
+        # P0#1 (Optimierung): loadFinished der Canvas-Page abonnieren – sobald
+        # die Page-Shell geladen ist, laufen alle Folge-Render per
+        # Plotly.react (kein setHtml/Seiten-Reload mehr). Defensiv: FakeViews
+        # in Tests haben ggf. keine echte QWebEnginePage (kein loadFinished).
+        canvas = getattr(self.ui, "canvas", None)
+        if canvas is not None:
+            page_fn = getattr(canvas, "page", None)
+            if callable(page_fn):
+                try:
+                    qpage = page_fn()
+                except Exception:
+                    qpage = None
+                if qpage is not None:
+                    lf = getattr(qpage, "loadFinished", None)
+                    if lf is not None:
+                        try:
+                            lf.connect(self._on_canvas_load_finished)
+                        except Exception:
+                            pass
 
     # ------------------------------------------------------------------
     # Events
@@ -547,14 +652,17 @@ class AlgoPlaygroundController(QObject):
         self._render_chart(preserve_view=False)
 
     def _load_candles(self, force_reload: bool = False) -> None:
-        """Laedt OHLCV-Kerzen (einmalig pro (Symbol, TF) oder erzwungen).
+        """Laedt OHLCV-Kerzen zeitraum-basiert (P1#5, statt 'letzte 5000').
 
-        Konzept 2.4: Beim Wechsel von Symbol oder TF wird der DataFrame
-        einmalig aus dem MarketDataRepository geladen und gecacht; danach
-        arbeiten alle Playground-Berechnungen auf diesem Cache (kein
-        Neuladen bei Zeitraum-Aenderungen). Nach einem Scan (force_reload)
-        wird der Cache verworfen und frisch geladen (Bugfix 17.08.2026:
-        sonst blieben alte Kerzen trotz neuer DB-Daten sichtbar).
+        P1#5 (Optimierung, behebt A4 'fast leeres 30-Tage-Chart'):
+          * Geladen wird der AKTUELLE Zeitraum [from_epoch, to_epoch] plus
+            Panning-Margin (CACHE_MARGIN_RATIO) – nicht mehr pauschal die
+            letzten CANDLE_LIMIT-Kerzen.
+          * Der Cache bleibt gueltig, solange ein Zeitraum-Wechsel innerhalb
+            der geladenen Grenzen liegt (_cache_covers, kein Neuladen).
+          * Nach einem Scan (force_reload) wird der Cache verworfen und
+            frisch geladen (Bugfix 17.08.2026: alte Kerzen trotz neuer
+            DB-Daten waren sonst sichtbar).
         """
         if not hasattr(self.ui, "current_symbol") or \
                 not hasattr(self.ui, "current_timeframe"):
@@ -562,9 +670,11 @@ class AlgoPlaygroundController(QObject):
         symbol = self.ui.current_symbol()
         timeframe = self.ui.current_timeframe()
         pair = (symbol, timeframe)
-        if not force_reload and self._last_pair == pair and \
-                self._candles_cache is not None:
-            return  # Cache fuer dieses Paar ist noch gueltig
+        from_epoch, to_epoch = self.ui.time_range.get_range()
+        if (not force_reload and self._last_pair == pair and
+                self._candles_cache is not None and
+                self._cache_covers(from_epoch, to_epoch)):
+            return  # Cache fuer dieses Paar deckt den Zeitraum ab
 
         # Bugfix 17.08.2026 (Datums-Persistenz): Max-Epoch des ALTEN Caches
         # merken, damit _extend_range_to_latest den Anwender-Zeitraum nicht
@@ -575,15 +685,45 @@ class AlgoPlaygroundController(QObject):
             self._last_cache_max = None
 
         self._last_pair = pair
-        candles, _ = self._data_repo.fetch_historical_candles(
-            symbol, timeframe, limit=self.CANDLE_LIMIT)
+        # P1#5: Zeitraum + Margin als Query-Fenster (Panning-Puffer).
+        span = max(1, int(to_epoch) - int(from_epoch))
+        margin = int(span * self.CACHE_MARGIN_RATIO)
+        q_from = int(from_epoch) - margin
+        q_to = int(to_epoch) + margin
+        candles, _ = self._data_repo.fetch_candles_in_range(
+            symbol, timeframe, q_from, q_to, limit=self.MAX_CACHE_CANDLES)
         if candles:
             self._candles_cache = pd.DataFrame(candles)
+            # Tatsaechliche Daten-Grenzen (nicht Query-Fenster): bei Cap-
+            # Ueberschreitung (sehr grosse Zeitraeume) ist nur der geladene
+            # Teil abgedeckt.
+            self._cache_from = int(self._candles_cache["time"].min())
+            self._cache_to = int(self._candles_cache["time"].max())
         else:
             # Keine Daten (noch) vorhanden -> leerer Zustand.
             self._candles_cache = None
+            self._cache_from = None
+            self._cache_to = None
         self.ui.status_label.setText(
             f"Status: {len(candles)} Kerzen geladen ({symbol} {timeframe})")
+
+    def _cache_covers(self, from_epoch: int, to_epoch: int) -> bool:
+        """Prueft, ob der RAM-Cache den Zeitraum abdeckt (P1#5).
+
+        Toleranz: 1% des Zeitraums (min. 1 Stunde) – verhindert Reload-
+        Flapping an den Raendern (z. B. Bis-Datum kurz hinter der letzten
+        Kerze = 'Zukunft', fuer die es keine Daten gibt).
+        """
+        if self._candles_cache is None or self._candles_cache.empty:
+            return False
+        if self._cache_from is None or self._cache_to is None:
+            return False
+        from_epoch = int(from_epoch)
+        to_epoch = int(to_epoch)
+        span = max(1, to_epoch - from_epoch)
+        slack = max(int(span * 0.01), 3600)
+        return (self._cache_from <= from_epoch + slack and
+                self._cache_to >= to_epoch - slack)
 
     def _extend_range_to_latest(self) -> None:
         """Erweitert das Bis-Datum auf die neueste Kerze (nach Sync).
@@ -618,35 +758,50 @@ class AlgoPlaygroundController(QObject):
         self.refresh_chart()
 
     def _on_range_changed(self, *_args) -> None:
-        """Zeitraum geaendert: nur Slicen + rendern (Cache bleibt).
+        """Zeitraum geaendert: Cache-Check + Slicen + rendern.
+
+        P1#5 (Optimierung): Liegt der neue Zeitraum ausserhalb der geladenen
+        Cache-Grenzen (inkl. Panning-Toleranz), wird zeitraum-basiert
+        nachgeladen – der Cache bleibt nur fuer kleine Verschiebungen
+        erhalten (Konzept 2.4).
 
         Bugfix 17.08.2026 (Datumsfelder setzen die Skala): Ein noch nicht
         konsumierter _pending_view (z. B. Restore-View) darf die NEU
         gewaehlte Zeitraum-Skala nicht ueberschreiben – die Datumsfelder
-        sind massgebend (build_candlestick_html setzt die X-Achse exakt
-        auf [from_epoch, to_epoch]).
+        sind massgebend (build_chart_figure setzt die X-Achse exakt auf
+        [from_epoch, to_epoch]).
         """
         self._pending_view = None
+        if self._candles_cache is not None and \
+                not self._cache_covers(*self.ui.time_range.get_range()):
+            self._load_candles()  # P1#5: Zeitraum ausserhalb des Caches
         self._render_chart(preserve_view=False)
 
     def _render_chart(self, preserve_view: bool = True) -> None:
-        """Baut das Candlestick-HTML (Zeitraum-Slice) und setzt es in den View.
+        """Baut die Plotly-Figur (Zeitraum-Slice) und wendet sie an (P0#1).
 
         Args:
             preserve_view: True (Default) -> der zuletzt bekannte Plotly-
-                Zoom/Skala wird beim Neuaufbau wieder angewendet (eingebettet
-                ins HTML), damit die Ansicht nach Checkbox-/Param-Aenderungen
-                nicht zurueckspringt. False -> keine Kontinuitaet (z. B.
-                Zeitraum oder Symbol/TF gewechselt); ein via restore_state
-                gesetzter _pending_view wird in jedem Fall angewendet.
+                Zoom/Skala wird beim Neuaufbau wieder angewendet (als
+                Achsen-Range in die Figur), damit die Ansicht nach
+                Checkbox-/Param-Aenderungen nicht zurueckspringt. False ->
+                keine Kontinuitaet (z. B. Zeitraum oder Symbol/TF gewechselt);
+                ein via restore_state gesetzter _pending_view wird in jedem
+                Fall angewendet.
 
-        Die setHtml-BaseUrl zeigt auf das assets/-Verzeichnis, damit die
-        lokale plotly.min.js-Datei geladen werden kann (Bugfix 17.08.2026:
-        ohne baseUrl laedt QWebEngineView keine file://-Scripts).
+        P0#1 (Optimierung): Statt bei jedem Render ein komplettes HTML zu
+        bauen und via setHtml() einen vollen Seiten-Reload (inkl. 4,8 MB
+        plotly.min.js) auszuloesen, wird die Figur als JSON gebaut und –
+        sobald die Page-Shell geladen ist – per Plotly.react() an die
+        bereits geladene Seite uebergeben (kein Reload, Zoom/Pan bleibt
+        erhalten; 0,5–2 s -> ~50–150 ms).
         """
         canvas = getattr(self.ui, "canvas", None)
         if canvas is None:
             return  # kein Canvas (z.B. Tests mit FakeView)
+
+        # P2#10: Interaktion merken -> View-Timer pollt die naechsten 5s.
+        self._last_interaction = time.monotonic()
 
         # Phase 6: Zoom-Kontinuitaet – letzten bekannten View uebernehmen.
         if preserve_view and self._last_view is not None:
@@ -666,24 +821,87 @@ class AlgoPlaygroundController(QObject):
 
         # Der gespeicherte View (Zoom/Skala) wird direkt als Achsen-Range in
         # die Plotly-Figur eingebettet (kein Post-Render-Skript/kein Race).
-        html = self._chart_service.build_candlestick_html(
+        figure = self._chart_service.build_chart_figure(
             self._candles_cache, from_epoch, to_epoch, symbol, timeframe,
             overlays=overlays, initial_view=self._pending_view)
         # Bugfix 17.08.2026: _pending_view nur konsumieren, wenn ein echter
-        # Chart gerendert wurde. Leere Render (keine Kerzen -> _EMPTY_HTML)
+        # Chart gerendert wurde. Leere Render (keine Kerzen -> Figure None)
         # duerfen den Restore-View nicht verwerfen – der View gilt fuer den
         # naechsten Render MIT Daten.
-        if _EMPTY_MARKER not in html:
+        if figure is not None:
             self._pending_view = None
 
-        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "..", "assets")
-        canvas.setHtml(html, QUrl.fromLocalFile(
-            os.path.normpath(assets_dir).replace("\\", "/") + "/"))
+        self._apply_figure(figure, symbol, timeframe)
 
         # Nach dem Render den frischen View (Restore-/Standardwerte)
         # einsammeln – fuer den naechsten preserve-Render bzw. save_state.
         QTimer.singleShot(500, self._poll_view)
+
+    def _apply_figure(self, figure: Optional[dict], symbol: str,
+                      timeframe: str) -> None:
+        """Wendet eine Plotly-Figur auf den Canvas an (P0#1, kein Reload).
+
+        Zustandsmaschine der Page-Shell:
+          * `figure is None` (leerer Zeitraum) -> Hinweis-HTML via setHtml;
+            die Shell wird beim naechsten Daten-Render neu aufgebaut.
+          * Sonst: Ist die Shell bereits geladen (_page_ready), wird die
+            Figur per Plotly.react() angewendet (kein setHtml). Ist die
+            Seite noch nicht (nachweislich) geladen, wird die Shell mit der
+            eingebetteten Figur via setHtml gesetzt – der loadFinished-
+            Handler wendet das Pending zusaetzlich per react an (idempotent),
+            und Test-Stubs ohne loadFinished sehen die Figur sofort.
+
+        Die setHtml-BaseUrl zeigt auf das assets/-Verzeichnis, damit die
+        lokale plotly.min.js-Datei geladen werden kann (Bugfix 17.08.2026:
+        ohne baseUrl laedt QWebEngineView keine file://-Scripts).
+        """
+        canvas = getattr(self.ui, "canvas", None)
+        if canvas is None or not hasattr(canvas, "setHtml"):
+            return  # kein echter Canvas (z.B. Minimal-FakeView in Tests)
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "assets")
+        base_url = QUrl.fromLocalFile(
+            os.path.normpath(assets_dir).replace("\\", "/") + "/")
+
+        if figure is None:
+            # Leerer Zustand -> Hinweis-HTML; _pending_view bleibt erhalten.
+            self._pending_figure_json = None
+            self._pending_empty = True
+            self._shell_set = False
+            self._page_ready = False
+            canvas.setHtml(
+                self._chart_service.build_page_html(symbol, timeframe, None),
+                base_url)
+            return
+
+        self._pending_figure_json = _fig_to_json(figure)
+        self._pending_empty = False
+        if self._page_ready:
+            # P0#1: Seite (Shell) geladen -> nur per Plotly.react.
+            self._run_js(_js_apply_figure(self._pending_figure_json))
+            return
+        # Seite noch nicht geladen -> Shell (einmalig) setzen.
+        self._shell_set = True
+        canvas.setHtml(
+            self._chart_service.build_page_html(
+                symbol, timeframe, self._pending_figure_json),
+            base_url)
+
+    def _on_canvas_load_finished(self, ok: bool) -> None:
+        """Slot: Page-Shell geladen -> Pending-Figur per Plotly.react anwenden.
+
+        P0#1: Erst wenn die Shell (plotly.min.js + Chart-Div) geladen ist,
+        darf per runJavaScript auf Plotly zugegriffen werden. Loads der
+        initialen Platzhalter-/Hinweis-Seiten (_shell_set False) werden
+        ignoriert.
+        """
+        if not self._shell_set:
+            return  # kein Shell-Load (z. B. Platzhalter oder _EMPTY_HTML)
+        self._page_ready = bool(ok)
+        if not self._page_ready:
+            return
+        if self._pending_figure_json is not None:
+            self._run_js(_js_apply_figure(self._pending_figure_json))
 
     # ------------------------------------------------------------------
     # Phase 6: Plotly-View (Zoom/Skala) lesen + Overlays inkrementell
@@ -691,14 +909,20 @@ class AlgoPlaygroundController(QObject):
     def _poll_view(self) -> None:
         """Timer: liest den aktuellen Plotly-View ASYNCHRON (kein Blocking).
 
-        Wird periodisch (2s) und nach jedem Render (singleShot 500ms)
+        Wird periodisch (500ms) und nach jedem Render (singleShot 500ms)
         ausgefuehrt. runJavaScript ist asynchron – das Ergebnis kommt als
         Queued-Callback im UI-Thread an (_on_view_read) und wird in
         _last_view gecacht. Kein QEventLoop/kein nested exec mehr
         (Bugfix 17.08.2026): der fruehere synchrone QEventLoop blockierte
         bis zu 800ms alle 2s die UI und vertrug sich schlecht mit
         QWebEngineView + QDateTimeEdit-Popups (Datumsfelder wirkten tot).
+
+        P2#10 (Optimierung): Nach VIEW_POLL_IDLE_S ohne Interaktion wird
+        nicht mehr gepollt (Idle-Skip) – save_state liest beim Schliessen
+        explizit (+ 300ms Event-Pump), daher geht kein Zoom verloren.
         """
+        if time.monotonic() - self._last_interaction > self.VIEW_POLL_IDLE_S:
+            return  # Idle: kein Lesen mehr noetig (P2#10)
         self._request_view_read()
 
     def _request_view_read(self) -> bool:
@@ -980,6 +1204,13 @@ class AlgoPlaygroundController(QObject):
             s = series.loc[mask]
             if s.empty:
                 continue
+            # P0#2 (Optimierung): LOD fuer Overlay-Serien – bei sehr grossen
+            # Zeitraeumen (z. B. 30 Tage M1 = 43k Punkte) nur noch max.
+            # LOD_MAX_OVERLAY_POINTS gleichmaessig verteilte Punkte rendern
+            # (vektorisiert, Endpunkte bleiben erhalten). Der RAM-Cache der
+            # Serie bleibt unveraendert (nur der Render wird reduziert).
+            if len(s) > self.LOD_MAX_OVERLAY_POINTS:
+                s = self._decimate_series(s, self.LOD_MAX_OVERLAY_POINTS)
             trace = {
                 "key": f"{instance_key}::{name}",
                 "name": f"{algo_id} ({name})",
@@ -1016,6 +1247,20 @@ class AlgoPlaygroundController(QObject):
     # ------------------------------------------------------------------
     # Interne Helfer
     # ------------------------------------------------------------------
+    @staticmethod
+    def _decimate_series(s: pd.Series, max_points: int) -> pd.Series:
+        """Gleichmaessiges Downsampling einer Serie (P0#2, vektorisiert).
+
+        Behaelt Endpunkte: np.linspace(0, n-1, max_points) liefert
+        gleichmaessig verteilte Indizes inkl. erstem/letztem Punkt – kein
+        Loop (Vektorisierung pur, Agents.md).
+        """
+        n = len(s)
+        if n <= max_points:
+            return s
+        idx = np.linspace(0, n - 1, max_points).astype(int)
+        return s.iloc[idx]
+
     def _schema_defaults(self, algo_id: str) -> Dict[str, Any]:
         """Liest die Default-Werte aus dem parameter_schema eines AlgOS."""
         schema = self.registry.get(algo_id, {}).get("schema", {})

@@ -21,12 +21,12 @@ standalone Plotly-HTML mit Candlestick + Dark-Theme und Zeitraum-Slice.
 Nur Build-Logik (SRP): KEIN Qt-Import, KEIN DuckDB-Zugriff.
 """
 
+import math
 import os
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 
 # Pfad zur lokalen (offline) plotly.min.js – relativ zum ui/-Paket.
 _PLOTLY_JS_REL = os.path.join("..", "assets", "plotly.min.js")
@@ -78,9 +78,38 @@ Keine Daten im gewaehlten Zeitraum.
 </body>
 </html>"""
 
+# P0#2 (Optimierung): LOD-Grenze fuer den Candlestick-Render. Bei mehr
+# sichtbaren Kerzen wird vektorisiert (np.minimum/maximum.reduceat) zu
+# OHLC-Buckets zusammengefasst – der Chart bleibt bei 30-Tage-M1 (43k
+# Kerzen) reaktionsfaehig, ohne dass Zoom/Pan darunter leiden.
+_LOD_MAX_CANDLES = 1200
+# P2#8 (Optimierung): "x unified"-Hover ist bei > dieser Kerzenzahl zu teuer
+# -> automatisch auf "closest" umschalten (nur der sichtbare Ausschnitt
+# zaehlt; die LOD-Reduktion senkt die gerenderten Punkte zusaetzlich).
+_HOVER_UNIFIED_MAX = 1200
+
+# Id der festen Chart-Div in der Page-Shell (P0#1: setHtml nur 1x; alle
+# Daten-Updates laufen ueber Plotly.react auf dieser Div).
+_CHART_DIV_ID = "pg-chart"
+
 
 class PlaygroundChartService:
-    """Erzeugt Plotly-HTML fuer den Playground-Canvas (Phase 4: Candlestick)."""
+    """Erzeugt Plotly-Figuren + Page-Shell fuer den Playground-Canvas.
+
+    P0#1 (Optimierung): Statt bei JEDER Aenderung ein komplettes HTML zu
+    bauen und via setHtml() einen vollen Seiten-Reload (inkl. 4,8 MB
+    plotly.min.js) auszuloesen, liefert dieser Service jetzt:
+      * build_chart_figure()  – das Figure-Dict (data/layout/config) als
+        schlankes, JSON-serialisierbares Plain-Dict (LOD + Hover-Adaption
+        inklusive),
+      * build_page_html()     – die EINMALIGE Page-Shell (plotly.min.js +
+        feste Chart-Div), in die die Figur beim ersten Render eingebettet
+        wird.
+    Alle Folge-Render laufen im Controller per Plotly.react() auf der
+    bereits geladenen Seite (kein Seiten-Reload, Zoom/Pan bleibt erhalten).
+
+    Nur Build-Logik (SRP): KEIN Qt-Import, KEIN DuckDB-Zugriff.
+    """
 
     @staticmethod
     def build_candlestick_html(
@@ -93,34 +122,58 @@ class PlaygroundChartService:
         overlays: Optional[list] = None,
         initial_view: Optional[dict] = None,
     ) -> str:
-        """Baut das Candlestick-HTML fuer den sichtbaren Zeitraum.
+        """Baut das komplette Candlestick-HTML (Wrapper, Abwaertskompatibilitaet).
 
-        Args:
-            candles_df: OHLCV-DataFrame mit Spalten 'time' (Epoch-Int,
-                Wanduhr-encoded), 'open', 'high', 'low', 'close'.
-            from_epoch: Start-Epoch des sichtbaren Ausschnitts (inkl.).
-            to_epoch:   End-Epoch des sichtbaren Ausschnitts (inkl.).
-            symbol:     Anzeige-Symbol (Titel).
-            timeframe:  Anzeige-Timeframe (Titel).
-            hide_gaps:  True (Default) -> Zeitluecken ohne Kerzen (Wochenende,
-                Handelspausen, kurze Handelstage) werden in der X-Achse
-                ausgeblendet (wie bei TradingView, Anwender-Anforderung).
-            overlays:   Optional. Liste von Overlay-Traces der Form
-                {"name": str, "x": pd.Series/Liste (Epochs),
-                 "y": pd.Series/Liste, "color": str} – wird als Liniengrafik
-                ueber die Candles gelegt (Phase 5).
-            initial_view: Optional. Gespeicherter Plotly-View
-                {"xrange": [wallclock-iso, wallclock-iso], "yrange": [float,
-                float]} – wird DIREKT als Achsen-Range in die Plotly-Figur
-                eingebettet (Phase 6, Restore von Zoom/Skala). Ohne View ist
-                die X-Achse exakt [from_epoch, to_epoch] (Datumsfelder sind
-                massgebend fuer die Skala, Bugfix 17.08.2026).
+        P0#1: Delegiert an build_chart_figure() + build_page_html(). Wird
+        nur noch fuer den ERSTEN Render (setHtml der Page-Shell) und fuer
+        Tests genutzt; alle Folge-Render laufen ueber Plotly.react().
 
         Returns:
-            Standalone-HTML-String (plotly.js offline als Datei referenziert).
+            Standalone-HTML-String (plotly.js offline als Datei referenziert);
+            bei leerem Zeitraum der "Keine Daten"-Hinweis.
+        """
+        figure = PlaygroundChartService.build_chart_figure(
+            candles_df, from_epoch, to_epoch, symbol, timeframe,
+            hide_gaps=hide_gaps, overlays=overlays,
+            initial_view=initial_view)
+        import json
+        fig_json = None
+        if figure is not None:
+            fig_json = json.dumps(figure)
+        return PlaygroundChartService.build_page_html(
+            symbol, timeframe, fig_json)
+
+    @staticmethod
+    def build_chart_figure(
+        candles_df: pd.DataFrame,
+        from_epoch: int,
+        to_epoch: int,
+        symbol: str,
+        timeframe: str,
+        hide_gaps: bool = True,
+        overlays: Optional[list] = None,
+        initial_view: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Baut das Plotly-Figure-Dict (data/layout/config) fuer den Zeitraum.
+
+        P0#1/P0#2 (Optimierung):
+          * Rueckgabe ist ein schlankes Plain-Dict (keine go.Figure/
+            to_plotly_json-Base64), direkt als JSON in die Page-Shell
+            einbettbar bzw. per Plotly.react() an die geladene Seite
+            uebergebbar.
+          * LOD: Bei > _LOD_MAX_CANDLES sichtbaren Kerzen wird vektorisiert
+            (np.minimum/maximum.reduceat) zu OHLC-Buckets zusammengefasst.
+          * P2#8: Hover-Modus adaptiv ("x unified" bis _HOVER_UNIFIED_MAX,
+            darueber "closest").
+
+        Args: siehe build_candlestick_html().
+
+        Returns:
+            {"data": [...], "layout": {...}, "config": {...}} oder None,
+            wenn keine Kerzen im Zeitraum liegen (leerer Zustand).
         """
         if candles_df is None or candles_df.empty:
-            return _EMPTY_HTML
+            return None
 
         # Vektorisiertes Zeitraum-Slicen (Konzept 2.4, kein Neuladen).
         mask = (candles_df["time"] >= int(from_epoch)) & \
@@ -128,121 +181,167 @@ class PlaygroundChartService:
         df = candles_df.loc[mask]
 
         if df.empty:
-            return _EMPTY_HTML
+            return None
 
         # Aufsteigend sortieren (DB liefert aufsteigend, defensiv nocheinmal).
         df = df.sort_values("time")
 
-        # Wanduhr-Konvention: Epoch-Zahl ist Wanduhr-encoded; naive
-        # Interpretation zeigt exakt die Wanduhr-Zeit (kein Berlin-Offset).
-        x = pd.to_datetime(df["time"], unit="s")
-
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=x,
-            open=df["open"],
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            name=f"{symbol} {timeframe}",
-            # Candlestick-Farben: gruen/rot (klassisch, dunkles Theme).
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-        ))
-
-        # Algo-Overlays (Phase 5): Linien-Traces ueber die Candles.
-        # Phase 7: Overlay-Dicts koennen zusaetzlich Stil-Attribute tragen:
-        #   render ("line"|"lines+markers"|"markers"), dash, width,
-        #   symbol, size (aus dem StylePickerWidget / LineStyle/MarkerStyle).
-        if overlays:
-            for ov in overlays:
-                if not isinstance(ov, dict):
-                    continue
-                ov_x = ov.get("x")
-                ov_y = ov.get("y")
-                if ov_x is None or ov_y is None:
-                    continue
-                # Epochs -> Wanduhr-Datetime (naiv, wie bei den Candles).
-                ov_x_dt = pd.to_datetime(list(ov_x), unit="s")
-                mode = str(ov.get("render", "line"))
-                if mode not in ("line", "lines+markers", "markers"):
-                    mode = "line"
-                # Intern "line" -> Plotly-mode "lines" (Plotly kennt kein "line").
-                mode = "lines" if mode == "line" else mode
-                color = str(ov.get("color", "#ff7f0e"))
-                # Bugfix Phase 7: Stil-Attribute werden DIREKT im go.Scatter-
-                # Konstruktor gesetzt (nachtraegliches `trace.line = dict(...)`
-                # uebernahm Plotly nicht zuverlaessig ins HTML). Die Mode-
-                # Pruefung muss nach dem Mapping auf "lines" laufen (frueher
-                # testete sie "line" -> dash/width wurden NIE gesetzt).
-                trace_kwargs = dict(
-                    x=ov_x_dt,
-                    y=list(ov_y),
-                    name=str(ov.get("name", "Overlay")),
-                    mode=mode,
-                    hovertemplate="%{y:.4f}<extra>%{fullData.name}</extra>",
-                )
-                if "lines" in mode:
-                    trace_kwargs["line"] = dict(
-                        color=color,
-                        dash=str(ov.get("dash", "solid")),
-                        width=float(ov.get("width", 1.5)),
-                    )
-                if "markers" in mode:
-                    trace_kwargs["marker"] = dict(
-                        color=color,
-                        symbol=str(ov.get("symbol", "circle")),
-                        size=float(ov.get("size", 6)),
-                    )
-                fig.add_trace(go.Scatter(**trace_kwargs))
-
-        fig.update_layout(
-            template="plotly_dark",
-            title=f"{symbol} {timeframe}",
-            xaxis_rangeslider_visible=False,
-            xaxis_title="Zeit (Wanduhr)",
-            # Preisachse (Y) auf der RECHTEN Seite wie bei TradingView/MT5
-            # (Anwender-Anforderung, 17.08.2026).
-            yaxis=dict(title="Preis", side="right"),
-            margin=dict(l=40, r=20, t=50, b=30),
-            autosize=True,
-            hovermode="x unified",
-            legend=dict(orientation="h", y=1.02),
-            # Normaler Klick-und-Drag verschiebt den Chart (TradingView-Stil),
-            # statt ein Auswahlrechteck zu ziehen.
-            dragmode="pan",
-        )
-
-        # Luecken ausblenden (Wochenende/Pausen/kurze Tage -> wie TradingView).
+        # Rangebreaks auf den ORIGINAL-Zeiten berechnen (P0#2: vor dem
+        # Downsampling, damit die Luecken-Grenzen exakt bleiben).
+        breaks = None
         if hide_gaps:
             breaks = PlaygroundChartService._build_rangebreaks(
                 df["time"].to_numpy())
-            if breaks:
-                fig.update_xaxes(rangebreaks=breaks)
 
-        # Bugfix 17.08.2026 (Datumsfelder setzen die Skala): Die X-Achse wird
-        # EXPLIZIT gesetzt – entweder auf den gespeicherten View (Restore/
-        # Zoom-Kontinuitaet) oder, wenn kein View vorliegt, exakt auf den
-        # eingestellten Zeitraum [from_epoch, to_epoch]. Damit ist der
-        # Zeitraum-Picker massgebend fuer die sichtbare Skala (kein stilles
-        # Autorange, das einen Datums-Wechsel optisch ignorieren kann). Die
-        # Wanduhr-naiven "YYYY-MM-DDTHH:MM:SS"-Strings entsprechen exakt dem
-        # Kerzen-x-Format (plotly parst beide als lokale Zeit -> konsistent).
+        # P2#8: Hover-Entscheidung vor dem Downsampling (originale Anzahl).
+        orig_count = len(df)
+        hovermode = "x unified" if orig_count <= _HOVER_UNIFIED_MAX \
+            else "closest"
+
+        # P0#2: LOD-Downsampling (nur fuer den RENDER, Cache bleibt voll).
+        df = PlaygroundChartService._maybe_downsample(df, _LOD_MAX_CANDLES)
+
+        # Wanduhr-Konvention: Epoch-Zahl ist Wanduhr-encoded; naive
+        # Interpretation zeigt exakt die Wanduhr-Zeit (kein Berlin-Offset).
+        # ISO-Strings (lokale Parse-Semantik in plotly.js) statt ms-Epochs,
+        # damit der Wanduhr-Roundtrip erhalten bleibt.
+        x_iso = pd.to_datetime(df["time"].to_numpy(), unit="s").strftime(
+            "%Y-%m-%dT%H:%M:%S").tolist()
+
+        data: list = [{
+            "type": "candlestick",
+            "x": x_iso,
+            "open": df["open"].tolist(),
+            "high": df["high"].tolist(),
+            "low": df["low"].tolist(),
+            "close": df["close"].tolist(),
+            "name": f"{symbol} {timeframe}",
+            # Candlestick-Farben: gruen/rot (klassisch, dunkles Theme).
+            "increasing": {"line": {"color": "#26a69a"}},
+            "decreasing": {"line": {"color": "#ef5350"}},
+        }]
+
+        # Algo-Overlays (Phase 5/7): Linien-/Marker-Traces ueber die Candles.
+        # Stil-Attribute (render, dash, width, symbol, size) kommen aus dem
+        # StylePickerWidget; die Controller-Traces sind bereits LOD-reduziert.
+        for ov in overlays or []:
+            if not isinstance(ov, dict):
+                continue
+            ov_x = ov.get("x")
+            ov_y = ov.get("y")
+            if ov_x is None or ov_y is None:
+                continue
+            ov_x_iso = pd.to_datetime(
+                np.asarray(list(ov_x), dtype="int64"), unit="s"
+            ).strftime("%Y-%m-%dT%H:%M:%S").tolist()
+            mode = str(ov.get("render", "line"))
+            if mode not in ("line", "lines+markers", "markers"):
+                mode = "line"
+            # Intern "line" -> Plotly-mode "lines" (Plotly kennt kein "line").
+            mode = "lines" if mode == "line" else mode
+            color = str(ov.get("color", "#ff7f0e"))
+            trace: dict = {
+                "type": "scatter",
+                "x": ov_x_iso,
+                "y": [float(v) for v in ov_y],
+                "name": str(ov.get("name", "Overlay")),
+                "mode": mode,
+                "hovertemplate": "%{y:.4f}<extra>%{fullData.name}</extra>",
+            }
+            if "lines" in mode:
+                trace["line"] = dict(
+                    color=color,
+                    dash=str(ov.get("dash", "solid")),
+                    width=float(ov.get("width", 1.5)),
+                )
+            if "markers" in mode:
+                trace["marker"] = dict(
+                    color=color,
+                    symbol=str(ov.get("symbol", "circle")),
+                    size=float(ov.get("size", 6)),
+                )
+            data.append(trace)
+
+        # Dunkles Theme explizit im Layout (kein Template-JSON noetig, haelt
+        # die Figur klein; Farben entsprechen plotly_dark/App-Hintergrund).
+        layout: dict = {
+            "paper_bgcolor": "#111418",
+            "plot_bgcolor": "#111418",
+            "font": {"color": "#d8d8d8"},
+            "title": {"text": f"{symbol} {timeframe}"},
+            "xaxis": {
+                "rangeslider": {"visible": False},
+                "title": {"text": "Zeit (Wanduhr)"},
+                "gridcolor": "#2a2f36",
+                "linecolor": "#2a2f36",
+                "zerolinecolor": "#2a2f36",
+            },
+            # Preisachse (Y) auf der RECHTEN Seite wie bei TradingView/MT5
+            # (Anwender-Anforderung, 17.08.2026).
+            "yaxis": {
+                "title": {"text": "Preis"},
+                "side": "right",
+                "gridcolor": "#2a2f36",
+                "linecolor": "#2a2f36",
+                "zerolinecolor": "#2a2f36",
+            },
+            "margin": {"l": 40, "r": 20, "t": 50, "b": 30},
+            "autosize": True,
+            "hovermode": hovermode,
+            "legend": {"orientation": "h", "y": 1.02},
+            # Normaler Klick-und-Drag verschiebt den Chart (TradingView-Stil),
+            # statt ein Auswahlrechteck zu ziehen.
+            "dragmode": "pan",
+        }
+
+        # Luecken ausblenden (Wochenende/Pausen/kurze Tage -> TradingView).
+        if breaks:
+            layout["xaxis"]["rangebreaks"] = breaks
+
+        # Bugfix 17.08.2026 (Datumsfelder setzen die Skala): X-Achse EXPLIZIT
+        # auf den gespeicherten View (Restore/Zoom) oder exakt auf den
+        # Zeitraum [from_epoch, to_epoch]. Wanduhr-naive ISO-Strings
+        # entsprechen exakt dem Kerzen-x-Format (plotly parst beide als
+        # lokale Zeit -> konsistent).
         view = initial_view if isinstance(initial_view, dict) else None
         if view and view.get("xrange"):
-            fig.update_xaxes(range=[view["xrange"][0], view["xrange"][1]])
+            layout["xaxis"]["range"] = [view["xrange"][0], view["xrange"][1]]
         else:
-            fig.update_xaxes(range=[
+            layout["xaxis"]["range"] = [
                 pd.to_datetime(int(from_epoch), unit="s").strftime(
                     "%Y-%m-%dT%H:%M:%S"),
                 pd.to_datetime(int(to_epoch), unit="s").strftime(
                     "%Y-%m-%dT%H:%M:%S"),
-            ])
+            ]
         if view and view.get("yrange"):
-            fig.update_yaxes(range=[view["yrange"][0], view["yrange"][1]])
+            layout["yaxis"]["range"] = [view["yrange"][0], view["yrange"][1]]
 
-        plot_div = fig.to_html(
-            full_html=False, include_plotlyjs=False, config=_PLOTLY_CONFIG)
+        return {"data": data, "layout": layout, "config": _PLOTLY_CONFIG}
+
+    @staticmethod
+    def build_page_html(symbol: str, timeframe: str,
+                        figure_json: Optional[str] = None) -> str:
+        """Baut die (einmalige) Page-Shell mit der festen Chart-Div.
+
+        P0#1 (Optimierung): Die Shell laedt plotly.min.js NUR HIER (Datei-
+        Referenz, kein Inline-4,8-MB-JS) und enthaelt eine feste Div
+        (_CHART_DIV_ID). Die Figur wird beim ersten Render als JSON
+        eingebettet (Plotly.react beim Laden); alle Folge-Render aktualisieren
+        die geladene Seite per Plotly.react() im Controller.
+
+        Args:
+            symbol/timeframe: Titel (wird im <title> und Layout gezeigt).
+            figure_json: JSON-String des Figures ({"data","layout","config"});
+                None -> "Keine Daten"-Hinweis-HTML (_EMPTY_HTML).
+
+        Returns:
+            Standalone-HTML-String.
+        """
+        if not figure_json:
+            return _EMPTY_HTML
+        # Defensive: "</script>" im eingebetteten JSON unschaedlich machen
+        # (JSON erlaubt den "\/"-Escape fuer "/").
+        safe_json = figure_json.replace("</", "<\\/")
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>PyBack Playground - {symbol} {timeframe}</title>
@@ -252,17 +351,66 @@ class PlaygroundChartService:
        (Anwender-Anforderung, 17.08.2026). */
     html, body {{ height: 100%; margin: 0; padding: 0;
                   background: #111418; overflow: hidden; }}
+    #{_CHART_DIV_ID} {{ width: 100%; height: 100%; }}
 </style>
 </head>
 <body style="{_BODY_STYLE}">
 <script src="{_PLOTLY_JS_URL}"></script>
-{plot_div}
+<div id="{_CHART_DIV_ID}"></div>
+<script>
+(function(){{
+  var gd = document.getElementById('{_CHART_DIV_ID}');
+  if (!gd || typeof Plotly === 'undefined') return;
+  var fig = {safe_json};
+  Plotly.react(gd, fig.data, fig.layout, fig.config);
+}})();
+</script>
 </body>
 </html>"""
 
     # ------------------------------------------------------------------
     # Interne Helfer
     # ------------------------------------------------------------------
+    @staticmethod
+    def _maybe_downsample(df: pd.DataFrame, max_candles: int) -> pd.DataFrame:
+        """Fasst OHLCV-Kerzen vektorisiert zu OHLC-Buckets zusammen (P0#2).
+
+        Bei n > max_candles wird jede Kerze einem Bucket der Groesse
+        ceil(n/max_candles) zugeordnet; pro Bucket werden open (erste),
+        high (max), low (min), close (letzte) und time (erste) vektorisiert
+        per np.maximum/np.minimum.reduceat aggregiert. Ein zu kleiner
+        Rest-Bucket (weniger als halbe Bucket-Groesse) wird mit dem
+        vorherigen verschmolzen.
+
+        Args:
+            df: OHLCV-DataFrame (aufsteigend nach 'time' sortiert).
+            max_candles: Obergrenze der Ausgabe-Kerzen.
+
+        Returns:
+            Reduzierter DataFrame (gleiche Spalten) oder df unveraendert,
+            wenn n <= max_candles.
+        """
+        n = len(df)
+        if n <= max_candles:
+            return df
+        bucket = int(math.ceil(n / max_candles))
+        times = df["time"].to_numpy().astype(np.int64)
+        opens = df["open"].to_numpy()
+        highs = df["high"].to_numpy()
+        lows = df["low"].to_numpy()
+        closes = df["close"].to_numpy()
+        starts = np.arange(0, n, bucket)
+        if len(starts) > 1 and n - starts[-1] < max(2, bucket // 2):
+            starts = starts[:-1]
+        ends = np.append(starts[1:], n)
+        return pd.DataFrame({
+            "time": times[starts],
+            "open": opens[starts],
+            "high": np.maximum.reduceat(highs, starts),
+            "low": np.minimum.reduceat(lows, starts),
+            "close": closes[ends - 1],
+        })
+
     @staticmethod
     def _build_rangebreaks(times) -> list:
         """Erkennt Luecken im Zeitverlauf und baut plotly-rangebreaks.
