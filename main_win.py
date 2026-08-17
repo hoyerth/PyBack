@@ -24,9 +24,11 @@ import sys
 from typing import List
 
 from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -118,8 +120,9 @@ class MainWin(QMainWindow):
     # UI-Aufbau
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        """Baut die Top-Zeile, Zeitraum-Zeile (Playground) und das Log."""
-        # -- Status-Zeile (unter der Top-Zeile) ----------------------------
+        """Baut die Top-Zeile, Zeitraum-Zeile (Playground), Canvas-Bereich
+        und unten die Statuszeile + Log (5 Zeilen hoch)."""
+        # -- Status-Zeile (ganz unten, ueber dem Log) ----------------------
         self.status_label = QLabel("Status: initialisiere ...")
         self.status_label.setStyleSheet("font-weight: bold; padding: 2px;")
 
@@ -170,14 +173,25 @@ class MainWin(QMainWindow):
         # -- Zeitraum-Zeile (Playground, Phase 1) --------------------------
         self.time_range = TimeRangeWidget()
 
-        # -- Log-Feld ------------------------------------------------------
+        # -- Canvas-Bereich (Platzhalter, Phase 4: QWebEngineView) ---------
+        # Nimmt den gesamten verbleibenden Platz zwischen Zeitraum-Zeile und
+        # Statuszeile ein (dehnbarer Frame).
+        self.canvas_placeholder = QFrame()
+        self.canvas_placeholder.setFrameShape(QFrame.StyledPanel)
+        self.canvas_placeholder.setMinimumHeight(200)
+
+        # -- Log-Feld (ganz unten, nur 5 Zeilen hoch) ----------------------
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
+        # 5 Zeilen Hoehe: Zeilenabstand * 5 + Rahmen/Innenabstand.
+        line_h = QFontMetrics(self.log.font()).lineSpacing()
+        self.log.setFixedHeight(line_h * 5 + 8)
 
         layout = QVBoxLayout()
         layout.addLayout(top_row)
         layout.addWidget(self.time_range)
+        layout.addWidget(self.canvas_placeholder, 1)  # dehnt sich aus
         layout.addWidget(self.status_label)
         layout.addWidget(self.log)
 

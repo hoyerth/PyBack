@@ -66,6 +66,8 @@ class TimeRangeWidget(QWidget):
         for preset_id in _PRESET_ORDER:
             btn = QPushButton(preset_id)
             btn.setCheckable(False)
+            # Schmal: fester Breite, sodass 3 Buchstaben ("YTD") gerade passen.
+            btn.setFixedWidth(44)
             btn.setToolTip(f"Zeitraum: {_preset_tooltip(preset_id)}")
             btn.clicked.connect(
                 lambda _=False, pid=preset_id: self._apply_preset(pid))
